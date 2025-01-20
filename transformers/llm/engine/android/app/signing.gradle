@@ -1,0 +1,10 @@
+ext{
+    signingConfigs = [
+        release: [
+            storeFile: file("path/to/jks"),
+            storePassword: "***",
+            keyAlias: "***",
+            keyPassword: "***"
+        ]
+    ]
+}
