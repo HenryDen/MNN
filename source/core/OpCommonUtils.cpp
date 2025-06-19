@@ -837,6 +837,21 @@ void OpCommonUtils::turnRegion2Convert(const Tensor::InsideDescribe::Region& reg
     if (srcFormat == dstFormat) {
         return;
     }
+#ifdef MNN_KLEIDIAI_ENABLED
+    if(srcFormat == MNN_DATA_FORMAT_NHWC || dstFormat == MNN_DATA_FORMAT_NHWC){
+        info.batch = origin->length(0);
+        if(srcFormat == MNN_DATA_FORMAT_NHWC){
+            info.channel = origin->length(3);
+            info.area = origin->length(1)* origin->length(2);
+        }
+        else{
+            info.channel = origin->length(1);
+            info.area = origin->length(2)* origin->length(3);
+        }
+        info.type = 1;
+        return;
+    }
+#endif
     if (srcFormat != MNN_DATA_FORMAT_NC4HW4 && dstFormat != MNN_DATA_FORMAT_NC4HW4) {
         return;
     }

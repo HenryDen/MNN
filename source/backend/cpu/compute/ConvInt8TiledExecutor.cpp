@@ -659,19 +659,36 @@ ErrorCode DenseConvInt8TiledExecutor::onResize(const std::vector<Tensor*>& input
     KleidiAI& kai = KleidiAI::getInstance();
     if(mResourceInt8->mDynamicQuant && mResourceInt8->mActBits == 4 && kai.canAccelerate(mAccelType)) {
         MNN_ASSERT(kai.isLoaded(mAccelType));
-        const size_t m = inputs[0]->batch(); //lhs vector number.
+        const size_t m = inputs[0]->batch() * inputs[0]->width() * inputs[0]->height(); //lhs vector number.
         const size_t n = outputs[0]->channel(); //rhs vector number.
         const size_t k = inputs[0]->channel(); //vector size.
         const size_t blkSize = mBlockNum == 1 ? 0 : k / mBlockNum;
+        auto inputOriginFmt = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
+        auto outputOriginFmt = TensorUtils::getDescribe(outputs[0])->dimensionFormat;
+        TensorUtils::getDescribe(outputs[0])->dimensionFormat = MNN_DATA_FORMAT_NHWC;
+        TensorUtils::getDescribe(inputs[0])->dimensionFormat = MNN_DATA_FORMAT_NHWC;
+
+       if(inputOriginFmt == MNN_DATA_FORMAT_NCHW || inputOriginFmt == MNN_DATA_FORMAT_NC4HW4){
+            auto& dim = TensorUtils::getDescribe(inputs[0])->dims;
+            auto inputDims = inputs[0]->buffer().dimensions;
+            auto channel = dim[1].extent;
+            for (int i = 1; i < inputDims - 1; ++i) {
+                dim[i].extent = dim[i + 1].extent;
+            }
+            dim[inputDims - 1].extent = channel;
+        }
+        if(outputOriginFmt == MNN_DATA_FORMAT_NCHW || outputOriginFmt == MNN_DATA_FORMAT_NC4HW4){
+            auto& dim = TensorUtils::getDescribe(outputs[0])->dims;
+            auto outputDims = outputs[0]->buffer().dimensions;
+            auto channel = dim[1].extent;
+            for (int i = 1; i < outputDims - 1; ++i) {
+                dim[i].extent = dim[i + 1].extent;
+            }
+            dim[outputDims - 1].extent = channel;
+        }
         
         int packedSize = kai.getLhsQuantedPackedSize(mAccelType, m, k, blkSize);
         int elementSize = kai.isHalf() ? sizeof(__fp16) : sizeof(float);
-        if(m > 1 && !kai.isLinear()) {
-            int srcSize = m * k * elementSize;
-            int dstSize = m * n * elementSize;
-            int extraSize = srcSize > dstSize ? srcSize : dstSize;
-            packedSize += extraSize;
-        }
         
         //Split mTempIm2ColBuffer as two parts for linear/tile transfer:
         //Part0: Lhs_packed.
@@ -947,7 +964,7 @@ ErrorCode DenseConvInt8TiledExecutor::onExecute(const std::vector<Tensor*>& inpu
     KleidiAI& kai = KleidiAI::getInstance();
     if(mResourceInt8->mDynamicQuant && mResourceInt8->mActBits == 4 && kai.canAccelerate(mAccelType)) {
         MNN_ASSERT(kai.isLoaded(mAccelType));
-        const size_t m = input->batch(); //lhs vector number.
+        const size_t m = input->batch() * input->width() * input->height(); //lhs vector number.
         const size_t n = output->channel(); //rhs vector number.
         const size_t k = input->channel(); //vector size.
         const size_t blkSize = mBlockNum == 1 ? 0 : k / mBlockNum;
@@ -961,36 +978,19 @@ ErrorCode DenseConvInt8TiledExecutor::onExecute(const std::vector<Tensor*>& inpu
         auto rhsPacked = mResourceInt8->mWeightInt8->host<uint8_t>();
         auto dst = output->host<uint8_t>();
 
-        uint8_t *linearLhs, *linearDst;
-        if(m > 1 && !kai.isLinear()) {
-            linearLhs = (uint8_t *)lhsPacked + lhsPackedSize;
-            linearDst = linearLhs;
-        } else {
-            linearLhs = lhs;
-            linearDst = dst;
-        }
-
         int threadNum = static_cast<CPUBackend*>(backend())->threadNumber();
         int threadNeed, vecPerThread;
 
         //Dynamic quant pack lhs.
         if(m == 1) {
-            kai.runLhsQuantPack(mAccelType, 1, k, blkSize, 1, linearLhs, lhsPacked);
+            kai.runLhsQuantPack(mAccelType, 1, k, blkSize, 1, lhs, lhsPacked);
         } else {
-            if(!kai.isLinear()) {
-                if(bHalf) {
-                    KleidiAIUtil::transferNC4HW4ToNCHW((__fp16 *)lhs, (__fp16 *)linearLhs, m, k);
-                } else {
-                    KleidiAIUtil::transferNC4HW4ToNCHW((float *)lhs, (float *)linearLhs, m, k);
-                }
-            }
-
             vecPerThread = kai.getVecNumPerThread(m, threadNum, kai.getMr(mAccelType, m));
             threadNeed = m % vecPerThread == 0 ? m / vecPerThread : (m / vecPerThread + 1);
             size_t srcStride = vecPerThread * k * elementSize;
 
             auto BatchDynamicQuant = [=, &kai](int tId) {
-                auto threadSrc = linearLhs + tId * srcStride;
+                auto threadSrc = lhs + tId * srcStride;
                 auto threadDst = lhsPacked + kai.getLhsQuantedPackedOffset(mAccelType, m, tId * vecPerThread, k, blkSize);
                 int vecNum = (tId == threadNeed - 1) ? (m - vecPerThread * tId) : vecPerThread; //Last threadN may less than vecPerThread.
                 kai.runLhsQuantPack(mAccelType, vecNum, k, blkSize, kai.getMr(mAccelType, m), threadSrc, threadDst);
@@ -1013,7 +1013,7 @@ ErrorCode DenseConvInt8TiledExecutor::onExecute(const std::vector<Tensor*>& inpu
 
         auto ThreadFunction = [=, &kai](int tId) {
             auto threadRhsPacked = rhsPacked + kai.getRhsPackedOffset(mAccelType, tId * vecPerThread, k, blkSize);
-            auto threadDst = linearDst + kai.getDstOffset(0, tId * vecPerThread, n, elementSize);
+            auto threadDst = dst + kai.getDstOffset(0, tId * vecPerThread, n, elementSize);
             int vecNum = (tId == threadNeed - 1) ? (n - vecPerThread * tId) : vecPerThread; //Last threadN may less than vecPerThread.
             float scalarMax = bHalf ? FLT16_MAX : FLT_MAX;
             kai.runMatmul(mAccelType, m, vecNum, k, blkSize, lhsPacked, threadRhsPacked, threadDst, n * elementSize, elementSize, scalarMax, -scalarMax);
@@ -1023,14 +1023,6 @@ ErrorCode DenseConvInt8TiledExecutor::onExecute(const std::vector<Tensor*>& inpu
             ThreadFunction((int)tId);
         }
         MNN_CONCURRENCY_END();
-
-        if(m > 1 && !kai.isLinear()) {
-            if(bHalf) {
-                KleidiAIUtil::transferNCHWToNC4HW4((__fp16 *)linearDst, (__fp16 *)dst, m, n);
-            } else {
-                KleidiAIUtil::transferNCHWToNC4HW4((float *)linearDst, (float *)dst, m, n);
-            }
-        }
 
         return NO_ERROR;
     }

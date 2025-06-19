@@ -128,8 +128,6 @@ namespace MNN {
         bool canAccelerate(AccelType type);
         bool isLoaded(AccelType type);
         void setLoaded(AccelType type) { mLoaded[(size_t)type] = true; }
-        bool isLinear() { return mLinear; }
-        void setLinear(bool bLinear) { mLinear = bLinear; }
 
         //Get info
         static AccelType getQIntAccelType(size_t bits, bool bAsymmetric, size_t blockSize);

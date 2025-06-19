@@ -187,8 +187,34 @@ ErrorCode Convolution1x1Strassen::onResize(const std::vector<Tensor *> &inputs, 
 #ifdef MNN_KLEIDIAI_ENABLED
     KleidiAI& kai = KleidiAI::getInstance();
     if (kai.canAccelerate(mAccelType)) {
-        if (batch != 1) {
-            int packedSize = kai.getLhsPackedSize(mAccelType, batch, ic);
+        auto inputOriginFmt = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
+        auto outputOriginFmt = TensorUtils::getDescribe(outputs[0])->dimensionFormat;
+        TensorUtils::getDescribe(outputs[0])->dimensionFormat = MNN_DATA_FORMAT_NHWC;
+        TensorUtils::getDescribe(inputs[0])->dimensionFormat = MNN_DATA_FORMAT_NHWC;
+
+       if(inputOriginFmt == MNN_DATA_FORMAT_NCHW || inputOriginFmt == MNN_DATA_FORMAT_NC4HW4){
+            auto& dim = TensorUtils::getDescribe(inputs[0])->dims;
+            auto inputDims = inputs[0]->buffer().dimensions;
+            auto channel = dim[1].extent;
+            for (int i = 1; i < inputDims - 1; ++i) {
+                dim[i].extent = dim[i + 1].extent;
+            }
+            dim[inputDims - 1].extent = channel;
+        }
+        if(outputOriginFmt == MNN_DATA_FORMAT_NCHW || outputOriginFmt == MNN_DATA_FORMAT_NC4HW4){
+            auto& dim = TensorUtils::getDescribe(outputs[0])->dims;
+            auto outputDims = outputs[0]->buffer().dimensions;
+            auto channel = dim[1].extent;
+            for (int i = 1; i < outputDims - 1; ++i) {
+                dim[i].extent = dim[i + 1].extent;
+            }
+            dim[outputDims - 1].extent = channel;
+        }
+        
+        auto m = batch * input->width() * input->height();
+
+        if (m != 1) {
+            int packedSize = kai.getLhsPackedSize(mAccelType, m, ic);
 
             mInputResource.reset(Tensor::createDevice<float>({packedSize}));
             bool success = backend()->onAcquireBuffer(mInputResource.get(), Backend::DYNAMIC);
@@ -301,7 +327,7 @@ ErrorCode Convolution1x1Strassen::onExecute(const std::vector<Tensor *> &inputs,
 #ifdef MNN_KLEIDIAI_ENABLED
     KleidiAI& kai = KleidiAI::getInstance();
     if (kai.canAccelerate(mAccelType)) {
-        const size_t m = input->batch(); //lhs vector number.
+        const size_t m = input->batch() * input->width() * input->height(); //lhs vector number.
         const size_t n = output->channel(); //rhs vector number.
         const size_t k = input->channel(); //vector size.
         auto lhsPacked = inputPtr;
