@@ -36,6 +36,81 @@ KleidiAI& KleidiAI::getInstance() {
     return *mKaiInstance;
 }
 
+KleidiAI::ConvolutionType KleidiAI::getConvolutionType(const Op* op, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs){       
+    if(inputs.size() != 1 || outputs.size() != 1){
+        return ConvolutionType::CONVOLUTION_TYPE_NOT_SUPPORT;
+    }
+    return getConvolutionType(op, inputs[0], outputs[0]);
+}
+
+KleidiAI::ConvolutionType KleidiAI::getConvolutionType(const Op* op, const Tensor*input, const Tensor* output){       
+    auto conv2d = op->main_as_Convolution2D();
+    auto quanParameter = conv2d->quanParameter();
+    auto common = op->main_as_Convolution2D()->common();
+#ifdef MNN_LOW_MEMORY
+    if (lowMemory && nullptr != weightQuantInfo.get() && originWeightSize == 0) {
+        if (cpuBackend->memoryMode() == BackendConfig::Memory_Low) {
+            do {
+                if (!weightQuantInfo->canUseInt4) {
+                    break;
+                }
+                auto convOp = op->main_as_Convolution2D();
+                auto core   = static_cast<CPUBackend*>(backend)->functions();
+                int oc      = convOp->common()->outputCount();
+                int ic      = convOp->common()->inputCount();
+
+                int blockNum   = 1;
+                int dequantCnt = weightQuantInfo->alphaSize;
+                if (weightQuantInfo->asymmetric) {
+                    dequantCnt /= 2;
+                }
+                blockNum = dequantCnt / oc;
+
+                bool bAsym     = weightQuantInfo->asymmetric;
+                size_t blkSize = blockNum == 1 ? 0 : ic / blockNum;
+
+                KleidiAI::AccelType accelType = KleidiAI::getQIntAccelType(4, bAsym, blkSize, core->bytes);
+
+                KleidiAI& kai = KleidiAI::getInstance(*MNNGetCPUInfo());
+                if (!kai.canAccelerate(accelType, convOp->common())) {
+                    break;
+                }
+
+                if (!kai.isLoaded(accelType)) {
+                    kai.setLoaded(accelType);
+                    kai.printInfo(accelType);
+                }
+
+                return new KleidiAIConvInt8(backend, op, weightQuantInfo, true, kai, accelType, blockNum);
+            } while (0);
+        }
+
+        // Have not supported the quantized weight.
+        return nullptr;
+    }
+#else
+    if (cpuBackend->memoryMode() == BackendConfig::Memory_Low) {
+        if (MNNGetCPUInfo()->sme2 && !weightQuantInfo) {
+            return new KleidiAIDenseConvolution(common, backend, originWeight, originWeightSize, bias, biasSize,
+                                                weightQuantInfo);
+        }
+
+        // Do nothing and fallback.
+        return nullptr;
+    }
+#endif
+    if(op->type() != OpType_Convolution || common->group() > 1){
+        return ConvolutionType::CONVOLUTION_TYPE_NOT_SUPPORT;
+    }
+    bool fastWay = common->kernelY() == 1 && common->kernelX() == 1
+    && output->width() == input->width() && output->height() == input->height()
+    && common->strideX() == 1 && common->strideY() == 1;
+    if(quanParameter == nullptr && fastWay){
+        return ConvolutionType::CONVOLUTION_FLOAT;
+    }
+    return ConvolutionType::CONVOLUTION_TYPE_NOT_SUPPORT;
+}
+
 //Print
 void KleidiAI::printInfo(AccelType type) {
     if(type == AccelType::ACC_TYPE_ERROR) {

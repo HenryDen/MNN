@@ -275,7 +275,20 @@ bool GeometryConvUtils::computeSingle(const Op* op, const std::vector<Tensor*>& 
     auto inputDes     = TensorUtils::getDescribe(newInputs[0]);
     auto format       = inputDes->dimensionFormat;
 
-    if (MNN_DATA_FORMAT_NC4HW4 != format) {
+#ifdef MNN_KLEIDIAI_ENABLED
+    KleidiAI& kai = KleidiAI::getInstance(*MNNGetCPUInfo());
+    auto kleidiAiEnabled = kai.getConvolutionType(op, inputs, outputs) != KleidiAI::ConvolutionType::CONVOLUTION_TYPE_NOT_SUPPORT;
+    if (kleidiAiEnabled && MNN_DATA_FORMAT_NHWC != format){
+        std::shared_ptr<Tensor> newInput(new Tensor(newInputs[0], Tensor::TENSORFLOW, false));
+        ConvertUtils::compute(newInputs[0], newInput.get(), res);
+        newInputs[0] = newInput.get();
+        res.extras.emplace_back(std::move(newInput));
+        std::shared_ptr<Tensor> newOutput(new Tensor(originOutput, Tensor::TENSORFLOW, false));
+        output        = newOutput.get();
+        newOutputs[0] = output;
+        res.extras.emplace_back(newOutput);
+    }
+    else if((!kleidiAiEnabled) && MNN_DATA_FORMAT_NC4HW4 != format){
         std::shared_ptr<Tensor> newInput(new Tensor(newInputs[0], Tensor::CAFFE_C4, false));
         ConvertUtils::compute(newInputs[0], newInput.get(), res);
         newInputs[0] = newInput.get();
@@ -285,6 +298,19 @@ bool GeometryConvUtils::computeSingle(const Op* op, const std::vector<Tensor*>& 
         newOutputs[0] = output;
         res.extras.emplace_back(newOutput);
     }
+#else
+    if (MNN_DATA_FORMAT_NC4HW4 != format) {
+
+        std::shared_ptr<Tensor> newInput(new Tensor(newInputs[0], Tensor::CAFFE_C4, false));
+        ConvertUtils::compute(newInputs[0], newInput.get(), res);
+        newInputs[0] = newInput.get();
+        res.extras.emplace_back(std::move(newInput));
+        std::shared_ptr<Tensor> newOutput(new Tensor(originOutput, Tensor::CAFFE_C4, false));
+        output        = newOutput.get();
+        newOutputs[0] = output;
+        res.extras.emplace_back(newOutput);
+    }
+#endif
     std::shared_ptr<Command> cmd(new Command);
     cmd->op      = op;
     cmd->inputs  = std::move(newInputs);
