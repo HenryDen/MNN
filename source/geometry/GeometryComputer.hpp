@@ -44,6 +44,10 @@ public:
         inline bool support(int option) const {
             return mMask & option;
         }
+        Backend* backend() const {
+            return mBackend.get();
+        }
+        
         std::shared_ptr<BufferStorage> mRasterOp;
         bool mNeedRelease = true;
     private:

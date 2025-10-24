@@ -144,8 +144,8 @@ namespace MNN {
 
         //Get info
         static AccelType getQIntAccelType(size_t bits, bool bAsymmetric, size_t blockSize, size_t bytes);
-        ConvolutionType getConvolutionType(const Op* op, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs);
-        ConvolutionType getConvolutionType(const Op* op, const Tensor* input, const Tensor* output);
+        ConvolutionType getConvolutionType(const Op* op, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, Backend* backend);
+        ConvolutionType getConvolutionType(const Op* op, const Tensor* input, const Tensor* output, Backend* backend);
         size_t getMr(AccelType type, size_t m = 1);
         size_t getNr(AccelType type);
         size_t getKr(AccelType type);

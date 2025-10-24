@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
     // set hint
     MNN::RuntimeHint hint;
     hint.dynamicQuantOption = dynamicOption;
-    hint.enableKleidiAI = enableKleidiAI;
+    hint.enableKleidiAI = true;
     scope.Current()->getRuntime().second->setRuntimeHint(hint);
     MNNTestSuite::get()->pStaus.memory = memory;
     MNNTestSuite::get()->pStaus.precision = precision;

@@ -10,6 +10,8 @@
 #include <MNN/AutoTime.hpp>
 #include "GeometryConvUtils.hpp"
 #include "ConvertUtils.hpp"
+#include "backend/cpu/CPURuntime.hpp"
+#include "backend/cpu/arm/mnn_kleidiai.h"
 
 #define ADD_PAD_VALUE(POS, OFFSET, NUM, STRIDE)               \
     if (POS##Pad > 0) {                                       \
@@ -276,29 +278,32 @@ bool GeometryConvUtils::computeSingle(const Op* op, const std::vector<Tensor*>& 
     auto format       = inputDes->dimensionFormat;
 
 #ifdef MNN_KLEIDIAI_ENABLED
-    KleidiAI& kai = KleidiAI::getInstance(*MNNGetCPUInfo());
-    auto kleidiAiEnabled = kai.getConvolutionType(op, inputs, outputs) != KleidiAI::ConvolutionType::CONVOLUTION_TYPE_NOT_SUPPORT;
-    if (kleidiAiEnabled && MNN_DATA_FORMAT_NHWC != format){
-        std::shared_ptr<Tensor> newInput(new Tensor(newInputs[0], Tensor::TENSORFLOW, false));
-        ConvertUtils::compute(newInputs[0], newInput.get(), res);
-        newInputs[0] = newInput.get();
-        res.extras.emplace_back(std::move(newInput));
-        std::shared_ptr<Tensor> newOutput(new Tensor(originOutput, Tensor::TENSORFLOW, false));
-        output        = newOutput.get();
-        newOutputs[0] = output;
-        res.extras.emplace_back(newOutput);
+    auto backend = context.backend();
+    if(backend != nullptr && backend->type() == MNN_FORWARD_CPU) {
+        bool kleidiAiEnabled = backend->getRuntime()->hint().enableKleidiAI;
+        KleidiAI& kai = KleidiAI::getInstance(*MNNGetCPUInfo());
+        kleidiAiEnabled = kleidiAiEnabled && kai.getConvolutionType(op, inputs, outputs, backend) != KleidiAI::ConvolutionType::CONVOLUTION_TYPE_NOT_SUPPORT;
+        if (kleidiAiEnabled && MNN_DATA_FORMAT_NHWC != format){
+            std::shared_ptr<Tensor> newInput(new Tensor(newInputs[0], Tensor::TENSORFLOW, false));
+            ConvertUtils::compute(newInputs[0], newInput.get(), res);
+            newInputs[0] = newInput.get();
+            res.extras.emplace_back(std::move(newInput));
+            std::shared_ptr<Tensor> newOutput(new Tensor(originOutput, Tensor::TENSORFLOW, false));
+            output        = newOutput.get();
+            newOutputs[0] = output;
+            res.extras.emplace_back(newOutput);
+            std::shared_ptr<Command> cmd(new Command);
+            cmd->op      = op;
+            cmd->inputs  = std::move(newInputs);
+            cmd->outputs = std::move(newOutputs);
+            res.command.emplace_back(std::move(cmd));
+            if (originOutput != output) {
+                ConvertUtils::compute(output, originOutput, res);
+            }
+            return true;
+        }
     }
-    else if((!kleidiAiEnabled) && MNN_DATA_FORMAT_NC4HW4 != format){
-        std::shared_ptr<Tensor> newInput(new Tensor(newInputs[0], Tensor::CAFFE_C4, false));
-        ConvertUtils::compute(newInputs[0], newInput.get(), res);
-        newInputs[0] = newInput.get();
-        res.extras.emplace_back(std::move(newInput));
-        std::shared_ptr<Tensor> newOutput(new Tensor(originOutput, Tensor::CAFFE_C4, false));
-        output        = newOutput.get();
-        newOutputs[0] = output;
-        res.extras.emplace_back(newOutput);
-    }
-#else
+#endif
     if (MNN_DATA_FORMAT_NC4HW4 != format) {
 
         std::shared_ptr<Tensor> newInput(new Tensor(newInputs[0], Tensor::CAFFE_C4, false));
@@ -310,7 +315,7 @@ bool GeometryConvUtils::computeSingle(const Op* op, const std::vector<Tensor*>& 
         newOutputs[0] = output;
         res.extras.emplace_back(newOutput);
     }
-#endif
+
     std::shared_ptr<Command> cmd(new Command);
     cmd->op      = op;
     cmd->inputs  = std::move(newInputs);
