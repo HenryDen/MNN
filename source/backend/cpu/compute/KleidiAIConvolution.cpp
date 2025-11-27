@@ -29,6 +29,8 @@ KleidiAIConvolution::KleidiAIConvolution(const Convolution2DCommon *common, Back
         if (b->getRuntime()->hint().useCachedMmap > 1) {
             return;
         }
+
+        mComputeThreads = b->getRuntime()->hint().kleidiAIThreadNumber;
         KleidiAI& kai = KleidiAI::getInstance(*MNNGetCPUInfo());
 
         if (core->bytes == 2) {
@@ -212,8 +214,16 @@ ErrorCode KleidiAIConvolution::onExecute(const std::vector<Tensor *> &inputs, co
     if(outputDes->dimensionFormat != MNN_DATA_FORMAT_NHWC){
         outputPtr = mOutputConvertBuffer->host<uint8_t>();
     }
-
-    kai.runMatmul(mAccelType, m, n, k, 0, lhsPacked, weightPtr, outputPtr, n * elementSize, elementSize, mPostParameters[3], mPostParameters[2]);
+    
+    int vecPerThread = kai.getVecNumPerThread(n, mComputeThreads, kai.getNStep(mAccelType));
+    int threadNeed = n % vecPerThread == 0 ? n / vecPerThread : (n / vecPerThread + 1);
+    MNN_CONCURRENCY_BEGIN(tId, threadNeed) {
+        auto threadRhsPacked = weightPtr + kai.getRhsPackedOffset(mAccelType, tId * vecPerThread, k, 0);
+        auto threadDst = outputPtr + kai.getDstOffset(0, tId * vecPerThread, n, elementSize);
+        int vecNum = (tId == threadNeed - 1) ? (n - vecPerThread * tId) : vecPerThread; //Last threadN may less than vecPerThread.
+        kai.runMatmul(mAccelType, m, vecNum, k, 0, lhsPacked, threadRhsPacked, threadDst, n * elementSize, elementSize, mPostParameters[3], mPostParameters[2]);}
+    MNN_CONCURRENCY_END();
+    
 
     if(outputDes->dimensionFormat != MNN_DATA_FORMAT_NHWC){
         MNN_CONCURRENCY_BEGIN(tId, threadNum) {

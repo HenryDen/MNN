@@ -380,7 +380,10 @@ size_t KleidiAI::getRhsPackedOffset(AccelType type, size_t nIdx, size_t k, size_
         } else {
             return kai_get_rhs_packed_offset_rhs_pack_nxk_qai4c32p_qau4c32s0s1_f32_f32_f32_neon(nIdx, k, getNr(type), getKr(type), bl);
         }
-        
+    case AccelType::FP16:
+        return kai_get_rhs_packed_offset_rhs_pack_nxk_x16p2vlx2b_x16_x16_sme(nIdx, k);
+    case AccelType::FP32:
+        return kai_get_rhs_packed_offset_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme(nIdx, k);
     default:
         MNN_ASSERT(0);
         return 0;

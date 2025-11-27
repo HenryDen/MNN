@@ -68,6 +68,7 @@ struct RuntimeHint {
     bool useArmSme2Cores = true;
 
     bool enableKleidiAI = false;
+    int kleidiAIThreadNumber = 4;
 
     // Use CPU Ids
     std::vector<int> cpuIds;

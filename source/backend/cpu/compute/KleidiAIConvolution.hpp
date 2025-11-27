@@ -26,6 +26,7 @@ class KleidiAIConvolution : public CPUConvolution{
         std::shared_ptr<CPUConvolution::Resource> mResource;
         KleidiAI::AccelType mAccelType = KleidiAI::AccelType::ACC_TYPE_NUMBER;
         std::vector<float> mPostParameters;
+        int mComputeThreads = 4;
 };
 } // namespace MNN
 #endif
