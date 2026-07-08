@@ -17,6 +17,7 @@
 #include "core/Concurrency.h"
 #include "core/TensorUtils.hpp"
 #include "backend/cpu/CPUTensorConvert.hpp"
+#include <MNN/AutoTime.hpp>
 
 // KleidiAI micro-kernel headers (int4 / int8 dynamic-quant matmul + packing).
 // The symmetric per-channel int4 path is served by the asymmetric qsi8d32/qai4c32
@@ -36,6 +37,8 @@
 #include "kai_matmul_clamp_f32_qsi8d32p1x4_qai4c32p4vlx4_1x4vl_sme2_dot.h"
 #include "kai_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa.h"
 #include "kai_matmul_clamp_f16_qsi8d32p1x4_qai4c32p4vlx4_1x4vl_sme2_dot.h"
+#include "kai_lhs_pack_f16pmrx4_f32_neon.h"
+#include "kai_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa.h"
 
 #define QUANT_INFO_BYTES 4
 namespace MNN {
@@ -170,10 +173,17 @@ void rhsPackAsymNeon(size_t numGroups, size_t n, size_t k, size_t nr, size_t kr,
 // ---- lhs quanted packed size ----
 DEFINE_LHS_INFO_BLK(lhsSizeAsymF32,  kai_get_lhs_packed_size_lhs_quant_pack_qsi8d32pscalef32_f32_neon)
 DEFINE_LHS_INFO_BLK(lhsSizeAsymF16,  kai_get_lhs_packed_size_lhs_quant_pack_qsi8d32pscalef32_f16_neon)
+size_t lhsSizeDirectF32(size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t sr) {
+    if (m == 1) {
+        return kai_get_lhs_packed_size_lhs_quant_pack_qsi8d32pscalef32_f32_neon(m, k, bl, 1, kr, sr);
+    }
+    return kai_get_lhs_packed_size_lhs_pack_f16pmrx4_f32_neon(m, k, bl, mr, kr, sr);
+}
 
 // ---- lhs quanted packed offset ----
 DEFINE_LHS_INFO_BLK(lhsOffAsymF32,   kai_get_lhs_packed_offset_lhs_quant_pack_qsi8d32pscalef32_f32_neon)
 DEFINE_LHS_INFO_BLK(lhsOffAsymF16,   kai_get_lhs_packed_offset_lhs_quant_pack_qsi8d32pscalef32_f16_neon)
+DEFINE_LHS_INFO_BLK(lhsOffDirectF32,  kai_get_lhs_packed_offset_lhs_pack_f16pmrx4_f32_neon)
 
 // ---- lhs quant + pack ----
 void lhsPackAsymF32(size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t sr, const void* lhs, void* out) {
@@ -181,6 +191,13 @@ void lhsPackAsymF32(size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t 
 }
 void lhsPackAsymF16(size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t sr, const void* lhs, void* out) {
     kai_run_lhs_quant_pack_qsi8d32pscalef32_f16_neon(m, k, bl, mr, kr, sr, 0, (const __fp16*)lhs, k * sizeof(__fp16), out);
+}
+void lhsPackDirectF32(size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t sr, const void* lhs, void* out) {
+    if (m == 1) {
+        lhsPackAsymF32(m, k, bl, 1, kr, sr, lhs, out);
+        return;
+    }
+    kai_run_lhs_pack_f16pmrx4_f32_neon(m, k, bl, mr, kr, sr, 0, lhs, k * sizeof(float), out);
 }
 
 // ---- matmul (GEMV when m == 1, GEMM otherwise) ----
@@ -216,6 +233,16 @@ void matmulAsymF16Neon(size_t m, size_t n, size_t k, size_t bl, const void* lhs,
         kai_run_matmul_clamp_f16_qsi8d32p4x8_qai4c32p4x8_8x4_neon_i8mm(m, n, k, bl, lhs, rhs, (float*)dst, sr, sc, mn, mx);
     }
 }
+void matmulDirectF32Sme2(size_t m, size_t n, size_t k, size_t bl, const void* lhs, const void* rhs, void* dst,
+                         size_t sr, size_t sc, float mn, float mx) {
+    if (m == 1) {
+        kai_run_matmul_clamp_f32_qsi8d32p1x4_qai4c32p4vlx4_1x4vl_sme2_dot(
+            m, n, k, bl, lhs, rhs, (float*)dst, sr, sc, mn, mx);
+        return;
+    }
+    kai_run_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa(
+        m, n, k, bl, lhs, rhs, (float*)dst, sr, sc, mn, mx);
+}
 
 #undef DEFINE_RHS_INFO
 #undef DEFINE_LHS_INFO_CHNL
@@ -231,12 +258,99 @@ void KleidiAIConvInt8::configKernel() {
     mSme2 = cpu->sme2;
     mDot  = cpu->dot;
     mI8mm = cpu->i8mm;
+    mHybrid = false;
     mChnlQuant = (mKernelType == KernelType::QI4_SYM_PERCHANNEL_F32
                   || mKernelType == KernelType::QI4_ASYM_PERCHANNEL_F32
                   || mKernelType == KernelType::QI4_ASYM_PERCHANNEL_F16);
 
-    KernelParam& p = mParam;
-    Ukernel& u = mUkernel;
+    // Slot fillers. Each binds one (KernelParam, Ukernel) pair to a concrete kernel family so that
+    // both the primary (SME) and, when hybrid, the secondary (NEON) slot are configured identically.
+    auto fillSmeF32 = [](KernelParam& p, Ukernel& u) {
+        u.lhsPackedSize   = lhsSizeAsymF32;
+        u.lhsPackedOffset = lhsOffAsymF32;
+        u.runLhsQuantPack = lhsPackAsymF32;
+        p.mKaiMstepGemv = 1;
+        p.mKaiMstepGemm = kai_get_m_step_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiNStep     = kai_get_n_step_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiMrGemv    = 1;
+        p.mKaiMrGemm    = kai_get_mr_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiNr        = kai_get_nr_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiKr        = kai_get_kr_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiSr        = kai_get_sr_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        u.rhsPackedSize   = rhsSizeAsymSme2;
+        u.rhsPackedOffset = rhsOffAsymSme2;
+        u.runRhsPack      = rhsPackAsymSme2;
+        u.matmul          = matmulAsymF32Sme2;
+    };
+    auto fillNeonF32 = [](KernelParam& p, Ukernel& u) {
+        u.lhsPackedSize   = lhsSizeAsymF32;
+        u.lhsPackedOffset = lhsOffAsymF32;
+        u.runLhsQuantPack = lhsPackAsymF32;
+        p.mKaiMstepGemv = 1;
+        p.mKaiMstepGemm = 8;
+        p.mKaiNStep     = 4;
+        p.mKaiMrGemv    = 1;
+        p.mKaiMrGemm    = 4;
+        p.mKaiNr        = 4;
+        p.mKaiKr        = 16;
+        p.mKaiSr        = 2;
+        u.rhsPackedSize   = rhsSizeAsymNeon;
+        u.rhsPackedOffset = rhsOffAsymNeon;
+        u.runRhsPack      = rhsPackAsymNeon;
+        u.matmul          = matmulAsymF32Neon;
+    };
+    auto fillSmeDirectF32 = [](KernelParam& p, Ukernel& u) {
+        u.lhsPackedSize   = lhsSizeDirectF32;
+        u.lhsPackedOffset = lhsOffDirectF32;
+        u.runLhsQuantPack = lhsPackDirectF32;
+        p.mKaiMstepGemv = 1;
+        p.mKaiMstepGemm = kai_get_m_step_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiNStep     = kai_get_n_step_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiMrGemv    = 1;
+        p.mKaiMrGemm    = kai_get_mr_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiNr        = kai_get_nr_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiKr        = kai_get_kr_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiSr        = kai_get_sr_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        u.rhsPackedSize   = rhsSizeAsymSme2;
+        u.rhsPackedOffset = rhsOffAsymSme2;
+        u.runRhsPack      = rhsPackAsymSme2;
+        u.matmul          = matmulDirectF32Sme2;
+    };
+    auto fillSmeF16 = [](KernelParam& p, Ukernel& u) {
+        u.lhsPackedSize   = lhsSizeAsymF16;
+        u.lhsPackedOffset = lhsOffAsymF16;
+        u.runLhsQuantPack = lhsPackAsymF16;
+        p.mKaiMstepGemv = 1;
+        p.mKaiMstepGemm = kai_get_m_step_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiNStep     = kai_get_n_step_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiMrGemv    = 1;
+        p.mKaiMrGemm    = kai_get_mr_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiNr        = kai_get_nr_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiKr        = kai_get_kr_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        p.mKaiSr        = kai_get_sr_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
+        u.rhsPackedSize   = rhsSizeAsymSme2;
+        u.rhsPackedOffset = rhsOffAsymSme2;
+        u.runRhsPack      = rhsPackAsymSme2;
+        u.matmul          = matmulAsymF16Sme2;
+    };
+    auto fillNeonF16 = [](KernelParam& p, Ukernel& u) {
+        u.lhsPackedSize   = lhsSizeAsymF16;
+        u.lhsPackedOffset = lhsOffAsymF16;
+        u.runLhsQuantPack = lhsPackAsymF16;
+        p.mKaiMstepGemv = 1;
+        p.mKaiMstepGemm = 8;
+        p.mKaiNStep     = 4;
+        p.mKaiMrGemv    = 1;
+        p.mKaiMrGemm    = 4;
+        p.mKaiNr        = 4;
+        p.mKaiKr        = 16;
+        p.mKaiSr        = 2;
+        u.rhsPackedSize   = rhsSizeAsymNeon;
+        u.rhsPackedOffset = rhsOffAsymNeon;
+        u.runRhsPack      = rhsPackAsymNeon;
+        u.matmul          = matmulAsymF16Neon;
+    };
+
     switch (mKernelType) {
         // Symmetric per-channel int4 is served by the asymmetric qsi8d32/qai4c32 kernels:
         // the asym packer stores signed int4 (v-8), so w = scale*(v-8) + zero; symmetric is
@@ -244,69 +358,36 @@ void KleidiAIConvInt8::configKernel() {
         // the constructor.
         case KernelType::QI4_SYM_PERCHANNEL_F32:
         case KernelType::QI4_ASYM_PERCHANNEL_F32:
-        case KernelType::QI4_ASYM_PERBLOCK_F32:
-            u.lhsPackedSize   = lhsSizeAsymF32;
-            u.lhsPackedOffset = lhsOffAsymF32;
-            u.runLhsQuantPack = lhsPackAsymF32;
             if (mSme2) {
-                p.mKaiMstepGemv = 1;
-                p.mKaiMstepGemm = kai_get_m_step_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiNStep     = kai_get_n_step_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiMrGemv    = 1;
-                p.mKaiMrGemm    = kai_get_mr_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiNr        = kai_get_nr_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiKr        = kai_get_kr_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiSr        = kai_get_sr_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                u.rhsPackedSize   = rhsSizeAsymSme2;
-                u.rhsPackedOffset = rhsOffAsymSme2;
-                u.runRhsPack      = rhsPackAsymSme2;
-                u.matmul          = matmulAsymF32Sme2;
+                fillSmeF32(mParam, mUkernel);
+                if (mDot && mI8mm) {
+                    // Also configure the NEON slot so the two can run concurrently (SME + NEON).
+                    fillNeonF32(mParamNeon, mUkernelNeon);
+                    mHybrid = true;
+                }
             } else if (mDot && mI8mm) {
-                p.mKaiMstepGemv = 1;
-                p.mKaiMstepGemm = 8;
-                p.mKaiNStep     = 4;
-                p.mKaiMrGemv    = 1;
-                p.mKaiMrGemm    = 4;
-                p.mKaiNr        = 4;
-                p.mKaiKr        = 16;
-                p.mKaiSr        = 2;
-                u.rhsPackedSize   = rhsSizeAsymNeon;
-                u.rhsPackedOffset = rhsOffAsymNeon;
-                u.runRhsPack      = rhsPackAsymNeon;
-                u.matmul          = matmulAsymF32Neon;
+                fillNeonF32(mParam, mUkernel);
+            }
+            break;
+        case KernelType::QI4_ASYM_PERBLOCK_F32:
+            if (mSme2) {
+                // The direct kernel converts FP32 activations to packed FP16 and accumulates in
+                // FP32 ZA, avoiding dynamic INT8 quantization and per-block requantization.
+                fillSmeDirectF32(mParam, mUkernel);
+            } else if (mDot && mI8mm) {
+                fillNeonF32(mParam, mUkernel);
             }
             break;
         case KernelType::QI4_ASYM_PERCHANNEL_F16:
         case KernelType::QI4_ASYM_PERBLOCK_F16:
-            u.lhsPackedSize   = lhsSizeAsymF16;
-            u.lhsPackedOffset = lhsOffAsymF16;
-            u.runLhsQuantPack = lhsPackAsymF16;
             if (mSme2) {
-                p.mKaiMstepGemv = 1;
-                p.mKaiMstepGemm = kai_get_m_step_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiNStep     = kai_get_n_step_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiMrGemv    = 1;
-                p.mKaiMrGemm    = kai_get_mr_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiNr        = kai_get_nr_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiKr        = kai_get_kr_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                p.mKaiSr        = kai_get_sr_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa();
-                u.rhsPackedSize   = rhsSizeAsymSme2;
-                u.rhsPackedOffset = rhsOffAsymSme2;
-                u.runRhsPack      = rhsPackAsymSme2;
-                u.matmul          = matmulAsymF16Sme2;
+                fillSmeF16(mParam, mUkernel);
+                if (mDot && mI8mm) {
+                    fillNeonF16(mParamNeon, mUkernelNeon);
+                    mHybrid = true;
+                }
             } else if (mDot && mI8mm) {
-                p.mKaiMstepGemv = 1;
-                p.mKaiMstepGemm = 8;
-                p.mKaiNStep     = 4;
-                p.mKaiMrGemv    = 1;
-                p.mKaiMrGemm    = 4;
-                p.mKaiNr        = 4;
-                p.mKaiKr        = 16;
-                p.mKaiSr        = 2;
-                u.rhsPackedSize   = rhsSizeAsymNeon;
-                u.rhsPackedOffset = rhsOffAsymNeon;
-                u.runRhsPack      = rhsPackAsymNeon;
-                u.matmul          = matmulAsymF16Neon;
+                fillNeonF16(mParam, mUkernel);
             }
             break;
         default:
@@ -314,45 +395,47 @@ void KleidiAIConvInt8::configKernel() {
     }
 }
 
-size_t KleidiAIConvInt8::getRhsPackedSize(size_t n, size_t k, size_t bl) const {
-    return mUkernel.rhsPackedSize(n, k, getNr(), getKr(), getSr(), mChnlQuant ? k : bl);
+size_t KleidiAIConvInt8::getRhsPackedSize(const Ukernel& u, const KernelParam& p, size_t n, size_t k, size_t bl) const {
+    return u.rhsPackedSize(n, k, getNr(p), getKr(p), getSr(p), mChnlQuant ? k : bl);
 }
 
-size_t KleidiAIConvInt8::getRhsPackedOffset(size_t nIdx, size_t k, size_t bl) const {
+size_t KleidiAIConvInt8::getRhsPackedOffset(const Ukernel& u, const KernelParam& p, size_t nIdx, size_t k, size_t bl) const {
     if (nIdx == 0) {
         return 0;
     }
-    return mUkernel.rhsPackedOffset(nIdx, k, getNr(), getKr(), getSr(), mChnlQuant ? k : bl);
+    return u.rhsPackedOffset(nIdx, k, getNr(p), getKr(p), getSr(p), mChnlQuant ? k : bl);
 }
 
-void KleidiAIConvInt8::runRhsPack(size_t numGroups, size_t n, size_t k, size_t bl,
+void KleidiAIConvInt8::runRhsPack(const Ukernel& u, const KernelParam& p, size_t numGroups, size_t n, size_t k, size_t bl,
                                   const void* rhs, const void* scale, const void* zeroPoint, const void* bias,
                                   void* rhsPacked) const {
-    mUkernel.runRhsPack(numGroups, n, k, getNr(), getKr(), getSr(), mChnlQuant ? k : bl,
-                        rhs, scale, zeroPoint, bias, rhsPacked);
+    u.runRhsPack(numGroups, n, k, getNr(p), getKr(p), getSr(p), mChnlQuant ? k : bl,
+                 rhs, scale, zeroPoint, bias, rhsPacked);
 }
 
-size_t KleidiAIConvInt8::getLhsQuantedPackedSize(size_t m, size_t k, size_t bl) const {
-    return mUkernel.lhsPackedSize(m, k, mChnlQuant ? k : bl, getMr(m), getKr(), getSr());
+size_t KleidiAIConvInt8::getLhsQuantedPackedSize(const Ukernel& u, const KernelParam& p, size_t m, size_t k, size_t bl) const {
+    return u.lhsPackedSize(m, k, mChnlQuant ? k : bl, getMr(p, m), getKr(p), getSr(p));
 }
 
-size_t KleidiAIConvInt8::getLhsQuantedPackedOffset(size_t m, size_t mIdx, size_t k, size_t bl) const {
+size_t KleidiAIConvInt8::getLhsQuantedPackedOffset(const Ukernel& u, const KernelParam& p, size_t m, size_t mIdx, size_t k, size_t bl) const {
     if (mIdx == 0) {
         return 0;
     }
-    return mUkernel.lhsPackedOffset(mIdx, k, mChnlQuant ? k : bl, getMr(m), getKr(), getSr());
+    return u.lhsPackedOffset(mIdx, k, mChnlQuant ? k : bl, getMr(p, m), getKr(p), getSr(p));
 }
 
-void KleidiAIConvInt8::runLhsQuantPack(size_t m, size_t k, size_t bl, size_t mr, const void* lhs, void* lhsQuantedPacked) const {
-    mUkernel.runLhsQuantPack(m, k, mChnlQuant ? k : bl, mr, getKr(), getSr(), lhs, lhsQuantedPacked);
+void KleidiAIConvInt8::runLhsQuantPack(const Ukernel& u, const KernelParam& p, size_t m, size_t k, size_t bl, size_t mr,
+                                       const void* lhs, void* lhsQuantedPacked) const {
+    u.runLhsQuantPack(m, k, mChnlQuant ? k : bl, mr, getKr(p), getSr(p), lhs, lhsQuantedPacked);
 }
 
-void KleidiAIConvInt8::runMatmul(size_t m, size_t n, size_t k, size_t bl,
+void KleidiAIConvInt8::runMatmul(const Ukernel& u, const KernelParam& p, size_t m, size_t n, size_t k, size_t bl,
                                  const void* lhsPacked, const void* rhsPacked, void* dst,
                                  size_t dstStrideRow, size_t dstStrideCol,
                                  const float scalarMax, const float scalarMin) const {
-    mUkernel.matmul(m, n, k, mChnlQuant ? k : bl, lhsPacked, rhsPacked, dst,
-                    dstStrideRow, dstStrideCol, scalarMin, scalarMax);
+    (void)p;
+    u.matmul(m, n, k, mChnlQuant ? k : bl, lhsPacked, rhsPacked, dst,
+             dstStrideRow, dstStrideCol, scalarMin, scalarMax);
 }
 
 KleidiAIConvInt8::KleidiAIConvInt8(Backend* backend, const Op* op, std::shared_ptr<ConvolutionCommon::Int8Common> quanCommon, bool isDynamicQuant,
@@ -454,6 +537,23 @@ KleidiAIConvInt8::KleidiAIConvInt8(Backend* backend, const Op* op, std::shared_p
                (uint8_t*)quanCommon->weight.get(),
                (const void*)scalePtr, (const void*)zeroPtr, (const void*)biasPtr,
                weightPackedData);
+
+    if (mHybrid) {
+        // Pack a second copy of the weights in the NEON slot layout so the NEON kernels can run
+        // concurrently with the SME kernel on the remaining threads. Same scale/zero/bias, but a
+        // different packed layout, hence a separate static buffer (~2x weight memory).
+        int packedWeightSizeNeon = getRhsPackedSize(mUkernelNeon, mParamNeon, n, k, blkSize);
+        mWeightInt8Neon.reset(Tensor::createDevice<uint8_t>({packedWeightSizeNeon}));
+        bool successNeon = backend->onAcquireBuffer(mWeightInt8Neon.get(), Backend::STATIC);
+        if (!successNeon) {
+            MNN_ERROR("Out of static memory!\n");
+            return;
+        }
+        runRhsPack(mUkernelNeon, mParamNeon, 1, n, k, blkSize,
+                   (uint8_t*)quanCommon->weight.get(),
+                   (const void*)scalePtr, (const void*)zeroPtr, (const void*)biasPtr,
+                   mWeightInt8Neon->host<uint8_t>());
+    }
     return;
 }
 
@@ -461,6 +561,7 @@ KleidiAIConvInt8::KleidiAIConvInt8(Backend* backend, const Op* op, std::shared_p
 KleidiAIConvInt8::KleidiAIConvInt8(Backend* backend, const Op* op, const KleidiAIConvInt8& exe)
     : CPUConvolution(op->main_as_Convolution2D()->common(), backend),
     mWeightInt8(exe.mWeightInt8), mTempIm2ColBuffer(exe.mTempIm2ColBuffer),
+    mWeightInt8Neon(exe.mWeightInt8Neon),
     mKernelType(exe.mKernelType), mBlockNum(exe.mBlockNum) {
     configKernel();
 }
@@ -528,7 +629,21 @@ ErrorCode KleidiAIConvInt8::onResize(const std::vector<Tensor*>& inputs, const s
         return OUT_OF_MEMORY;
     }
 
+    if (mHybrid) {
+        // The NEON slot packs lhs with a different mr, so it needs its own packed buffer.
+        int packedSizeNeon = getLhsQuantedPackedSize(mUkernelNeon, mParamNeon, m, k, blkSize);
+        mTempIm2ColBufferNeon.reset(Tensor::createDevice<int8_t>({packedSizeNeon}));
+        bool successNeon = backend()->onAcquireBuffer(mTempIm2ColBufferNeon.get(), Backend::DYNAMIC);
+        if (!successNeon) {
+            MNN_ERROR("Out of dynamic memory!\n");
+            return OUT_OF_MEMORY;
+        }
+    }
+
     backend()->onReleaseBuffer(mTempIm2ColBuffer.get(), Backend::DYNAMIC);
+    if (mHybrid) {
+        backend()->onReleaseBuffer(mTempIm2ColBufferNeon.get(), Backend::DYNAMIC);
+    }
 
     if(inputOriginFmt != MNN_DATA_FORMAT_NHWC){
         b->onReleaseBuffer(mInputConvertBuffer.get(), Backend::DYNAMIC);
@@ -537,6 +652,123 @@ ErrorCode KleidiAIConvInt8::onResize(const std::vector<Tensor*>& inputs, const s
         b->onReleaseBuffer(mOutputConvertBuffer.get(), Backend::DYNAMIC);
     }
     return NO_ERROR;
+}
+
+// ---------------------------------------------------------------------------
+// Matmul latency cost model (calibrated on Apple M4, single core, fp16 lhs).
+//
+// Analytic estimate of the *matmul-only* latency in microseconds for one engine
+// slot, derived from the instruction counts of the SME2 MOPA int4 kernel
+// (kai_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa) and fit on
+// a single-thread stride-16 MNK sweep. Only used to balance the hybrid SME/NEON
+// column split, so only the SME-vs-NEON *ratio* matters; the absolute numbers
+// are M4-specific.
+//
+//   The MOPA kernel nests: N loop (step NR=64) x M loop (step MR=16) x K loop.
+//   Per (M,N) tile it issues K `smopa` and one dequant/store epilogue. Hence the
+//   dominant instruction counts are, with mTile=ceil(M/16), nPanel=ceil(N/64):
+//       T     = mTile * nPanel                (number of MOPA tiles)
+//       smopa = T * Kpad                       (Kpad = roundup(K,32))
+//   giving the per-channel model
+//       t = t0 + a*T + b*T*Kpad
+//   plus a K-independent narrow-store penalty for a single non-full N panel
+//   (nPanel==1, N<64), which is measurably slower per row:
+//       t += d * mTile * (NR - N)/NR
+//   This fits the sweep to ~2% MAPE (N>=64: ~1.3%). Per-block adds one extra
+//   dequant/rescale contribution per K block, proportional to T*(K/bl). M==1
+//   uses a separate GEMV dot-kernel model with its own per-block term. F16/F32
+//   and SME/NEON use separate coefficient sets because they bind different KAI
+//   micro-kernels (MOPA/DOT vs i8mm/dotprod).
+// ---------------------------------------------------------------------------
+static bool kaiKernelIsF16(KleidiAIConvInt8::KernelType type) {
+    return type == KleidiAIConvInt8::KernelType::QI4_ASYM_PERCHANNEL_F16
+        || type == KleidiAIConvInt8::KernelType::QI4_ASYM_PERBLOCK_F16;
+}
+
+static double kaiEstimateSmeUs(KleidiAIConvInt8::KernelType type, size_t m, size_t nCols, size_t k, size_t blkSize) {
+    if (m == 0 || nCols == 0) {
+        return 0.0;
+    }
+    bool perBlock = (blkSize != 0);
+    const int MR = 16, NR = 64;
+    int nPanel = (int)((nCols + NR - 1) / NR);
+    bool isF16 = kaiKernelIsF16(type);
+    if (m == 1) {                                       // GEMV fast path (dot kernel)
+        if (perBlock) {
+            if (!isF16) {
+                return 0.149284 + (double)nPanel * (0.00504713 + 3.0225e-4 * (double)k
+                                  + 0.00578995 * (double)k / (double)blkSize);
+            }
+            return 0.083925 + (double)nPanel * (0.00565402 + 2.7488e-4 * (double)k
+                              + 0.00773111 * (double)k / (double)blkSize);
+        }
+        if (!isF16) {
+            return (double)nPanel * (0.047204 + 3.31259e-4 * (double)k);
+        }
+        return nPanel * (0.0732 + 2.539e-4 * (double)k);
+    }
+    int mTile = (int)((m + MR - 1) / MR);
+    double T = (double)mTile * (double)nPanel;
+    double kpad = (double)(((k + 31) / 32) * 32);
+    double singleNarrow = 0.0;
+    if (nPanel == 1 && nCols < (size_t)NR) {
+        singleNarrow = (double)mTile * (double)(NR - (int)nCols) / (double)NR;
+    }
+    if (!isF16) {
+        if (!perBlock) {
+            return 0.272156 + 0.258691 * T + 5.210733e-04 * T * kpad + 0.558753 * singleNarrow;
+        }
+        return 0.397107 + 0.0778586 * T + 4.391517e-04 * T * kpad
+               + 0.186019 * T * (double)k / (double)blkSize + 0.59724 * singleNarrow;
+    }
+    if (!perBlock) {                                    // per-channel (blkSize == 0)
+        // Instruction-count model of the MOPA kernel (see comment above).
+        double t = 0.3797 + 0.29089 * T + 4.836073e-04 * T * kpad;
+        t += 0.43818 * singleNarrow;                    // single narrow panel penalty
+        return t;
+    }
+    // per-block (blkSize > 0): same MOPA count plus one dequant/rescale term per K block.
+    return 0.4685 + 0.09406 * T + 3.682232e-04 * T * kpad
+           + 0.19966 * T * (double)k / (double)blkSize;
+}
+
+static double kaiEstimateNeonUs(KleidiAIConvInt8::KernelType type, size_t m, size_t nCols, size_t k, size_t blkSize) {
+    if (m == 0 || nCols == 0) {
+        return 0.0;
+    }
+    bool perBlock = (blkSize != 0);
+    bool isF16 = kaiKernelIsF16(type);
+    const int MR = 8, NR = 4;
+    int nPanel = (int)((nCols + NR - 1) / NR);
+    if (m == 1) {                                       // GEMV dotprod kernel
+        if (perBlock) {
+            if (isF16) {
+                return 0.0300534 + (double)nPanel * (3.04287e-4 + 4.384333e-5 * (double)k
+                                  - 1.019584e-4 * (double)k / (double)blkSize);
+            }
+            return 0.0289183 + (double)nPanel * (3.53137e-4 + 4.364133e-5 * (double)k
+                              - 7.037887e-5 * (double)k / (double)blkSize);
+        }
+        if (isF16) {
+            return 0.0369377 + (double)nPanel * (-0.0029569 + 6.484345e-5 * (double)k);
+        }
+        return 0.0381022 + (double)nPanel * (-0.00302672 + 6.469778e-5 * (double)k);
+    }
+    int mTile = (int)((m + MR - 1) / MR);
+    double T = (double)mTile * (double)nPanel;
+    double mac = (double)m * (double)nCols * (double)k;
+    if (perBlock) {                                     // GEMM i8mm kernel, block-quant rhs
+        if (isF16) {
+            return -0.00574413 + 0.00306348 * T + 4.992718e-6 * mac
+                   + 7.96544e-4 * T * (double)k / (double)blkSize;
+        }
+        return -0.00475343 + 0.00235611 * T + 4.996617e-6 * mac
+               + 9.35294e-4 * T * (double)k / (double)blkSize;
+    }
+    if (isF16) {                                        // GEMM i8mm kernel, channel-quant rhs
+        return 0.0173908 + 0.00132875 * T + 5.538539e-6 * mac;
+    }
+    return 0.022823 + 0.000806611 * T + 5.522018e-6 * mac;
 }
 
 ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
@@ -556,14 +788,9 @@ ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const 
     const size_t blkSize = mBlockNum == 1 ? 0 : k / mBlockNum;
 
     size_t elementSize = core->bytes;
-    size_t lhsPackedSize = getLhsQuantedPackedSize(m, k, blkSize);
 
     auto lhs = input->host<uint8_t>();
-    auto lhsPacked = mTempIm2ColBuffer->host<int8_t>();
-    auto rhsPacked = mWeightInt8->host<uint8_t>();
-
     int threadNum = static_cast<CPUBackend*>(backend())->threadNumber();
-    int threadNeed, vecPerThread;
 
     if(inputDes->dimensionFormat != MNN_DATA_FORMAT_NHWC) {
         // Convert input to NHWC format.
@@ -574,26 +801,26 @@ ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const 
         lhs = mInputConvertBuffer->host<uint8_t>();
     }
 
-    //Dynamic quant pack lhs.
-    if(m == 1) {
-        runLhsQuantPack(1, k, blkSize, 1, lhs, lhsPacked);
-    } else {
-        vecPerThread = getVecNumPerThread(m, threadNum, getMr(m));
-        threadNeed = m % vecPerThread == 0 ? m / vecPerThread : (m / vecPerThread + 1);
-        size_t srcStride = vecPerThread * k * elementSize;
-
-        auto BatchDynamicQuant = [=](int tId) {
-            auto threadSrc = lhs + tId * srcStride;
-            auto threadDst = lhsPacked + getLhsQuantedPackedOffset(m, tId * vecPerThread, k, blkSize);
-            int vecNum = (tId == threadNeed - 1) ? (m - vecPerThread * tId) : vecPerThread; //Last threadN may less than vecPerThread.
-            runLhsQuantPack(vecNum, k, blkSize, getMr(m), threadSrc, threadDst);
-        };
-
-        MNN_CONCURRENCY_BEGIN(tId, threadNeed) {
-            BatchDynamicQuant((int)tId);
+    // Dynamic-quant + pack lhs into `out` using the given kernel slot. Splits the M dimension over
+    // the thread pool (single call for the GEMV m == 1 case).
+    auto packLhs = [&](const Ukernel& u, const KernelParam& p, int8_t* out) {
+        if (m == 1) {
+            runLhsQuantPack(u, p, 1, k, blkSize, getMr(p, m), lhs, out);
+            return;
+        }
+        size_t mr = getMr(p, m);
+        int vecPer = getVecNumPerThread(m, threadNum, mr);
+        int need = m % vecPer == 0 ? m / vecPer : (m / vecPer + 1);
+        size_t srcStride = (size_t)vecPer * k * elementSize;
+        MNN_CONCURRENCY_BEGIN(tId, need) {
+            int t = (int)tId;
+            auto threadSrc = lhs + (size_t)t * srcStride;
+            auto threadDst = out + getLhsQuantedPackedOffset(u, p, m, (size_t)t * vecPer, k, blkSize);
+            int vecNum = (t == need - 1) ? (m - vecPer * t) : vecPer; //Last threadN may less than vecPer.
+            runLhsQuantPack(u, p, vecNum, k, blkSize, mr, threadSrc, threadDst);
         }
         MNN_CONCURRENCY_END();
-    }
+    };
 
     //Run matmul.
     auto dst = output->host<uint8_t>();
@@ -601,27 +828,133 @@ ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const 
         //store matmul result to convert buffer.
         dst = mOutputConvertBuffer->host<uint8_t>();
     }
-
-    if(bSupportSme2()) {
-        //SME prefer running on single thread to obtain better performance/power consumption ratio.
-        threadNum = 1;
-    }
-
-    vecPerThread = getVecNumPerThread(n, threadNum, getNStep());
-    threadNeed = n % vecPerThread == 0 ? n / vecPerThread : (n / vecPerThread + 1);
     auto postPtr = getPostParameters();
 
-    auto ThreadFunction = [=](int tId) {
-        auto threadRhsPacked = rhsPacked + getRhsPackedOffset(tId * vecPerThread, k, blkSize);
-        auto threadDst = dst + getDstOffset(0, tId * vecPerThread, n, elementSize);
-        int vecNum = (tId == threadNeed - 1) ? (n - vecPerThread * tId) : vecPerThread; //Last threadN may less than vecPerThread.
-        runMatmul(m, vecNum, k, blkSize, lhsPacked, threadRhsPacked, threadDst, n * elementSize, elementSize, postPtr[3], postPtr[2]);
-    };
-
-    MNN_CONCURRENCY_BEGIN(tId, threadNeed) {
-        ThreadFunction((int)tId);
+    // Decide whether to split the N dimension between the SME slot (thread 0) and the NEON slot
+    // (threads 1..threadNum-1) so both run concurrently. Only possible when a NEON slot was packed
+    // (mHybrid) and more than one thread is available.
+    bool doHybrid = mHybrid && threadNum > 1;
+    size_t nSme = 0, nNeon = 0;
+    int neonThreads = 0;
+    if (doHybrid) {
+        neonThreads = threadNum - 1;
+        // Balance the N-split with the calibrated two-regime cost model: the SME slot runs
+        // columns [0, nSme) on one thread concurrently with the NEON slot running the remaining
+        // columns spread over neonThreads. Pick the SME column count (aligned to a whole number of
+        // SME N-steps) that minimises the concurrent finish time max(t_sme, t_neon_per_thread).
+        size_t nStepSme = getNStep(mParam);
+        size_t bestNSme = nStepSme;
+        double bestFinish = 1e300;
+        for (size_t cand = nStepSme; cand < (size_t)n; cand += nStepSme) {
+            size_t nn = (size_t)n - cand;
+            int perT = (int)((nn + (size_t)neonThreads - 1) / (size_t)neonThreads);
+            double tSme  = kaiEstimateSmeUs(mKernelType, m, cand, k, blkSize);
+            double tNeon = kaiEstimateNeonUs(mKernelType, m, (size_t)perT, k, blkSize);
+            double finish = tSme > tNeon ? tSme : tNeon;
+            if (finish < bestFinish) {
+                bestFinish = finish;
+                bestNSme = cand;
+            }
+        }
+        nSme = bestNSme;
+        if (nSme > n) {
+            nSme = n;
+        }
+        nNeon = n - nSme;
+        if (nSme == 0 || nNeon == 0) {
+            doHybrid = false;
+        }
     }
-    MNN_CONCURRENCY_END();
+
+    if (!doHybrid) {
+        // Single-slot path: SME-only on one thread (SME prefers a single thread for better
+        // performance/power ratio) or NEON-only spread across all threads.
+        // TEMP bench hooks: MNN_KAI_MODE=neon forces the NEON slot (for isolated per-engine latency
+        // on a single thread); MNN_KAI_PROF=1 prints matmul-only latency as CSV for dataset collection.
+        const Ukernel* su = &mUkernel;
+        const KernelParam* sp = &mParam;
+        int8_t* sLhs = mTempIm2ColBuffer->host<int8_t>();
+        uint8_t* sRhs = mWeightInt8->host<uint8_t>();
+        const char* engTag = "SME";
+        static const char* kaiMode = getenv("MNN_KAI_MODE");
+        if (kaiMode != nullptr && kaiMode[0] == 'n' && mHybrid) {
+            su = &mUkernelNeon; sp = &mParamNeon;
+            sLhs = mTempIm2ColBufferNeon->host<int8_t>();
+            sRhs = mWeightInt8Neon->host<uint8_t>();
+            engTag = "NEON";
+        }
+        packLhs(*su, *sp, sLhs);
+        auto lhsPacked = sLhs;
+        auto rhsPacked = sRhs;
+        int matThreadNum = (bSupportSme2() && su == &mUkernel) ? 1 : threadNum;
+        int vecPerThread = getVecNumPerThread(n, matThreadNum, getNStep(*sp));
+        int threadNeed = n % vecPerThread == 0 ? n / vecPerThread : (n / vecPerThread + 1);
+        static const char* kaiProf = getenv("MNN_KAI_PROF");
+        static const char* kaiRepEnv = getenv("MNN_KAI_REP");
+        int kaiRep = (kaiProf != nullptr && kaiRepEnv != nullptr) ? atoi(kaiRepEnv) : 1;
+        if (kaiRep < 1) { kaiRep = 1; }
+        MNN::Timer _pt;
+        for (int rep = 0; rep < kaiRep; ++rep) {
+        MNN_CONCURRENCY_BEGIN(tId, threadNeed) {
+            int t = (int)tId;
+            auto threadRhsPacked = rhsPacked + getRhsPackedOffset(*su, *sp, t * vecPerThread, k, blkSize);
+            auto threadDst = dst + getDstOffset(0, t * vecPerThread, n, elementSize);
+            int vecNum = (t == threadNeed - 1) ? (n - vecPerThread * t) : vecPerThread; //Last threadN may less than vecPerThread.
+            runMatmul(*su, *sp, m, vecNum, k, blkSize, lhsPacked, threadRhsPacked, threadDst, n * elementSize, elementSize, postPtr[3], postPtr[2]);
+        }
+        MNN_CONCURRENCY_END();
+        }
+        if (kaiProf != nullptr) {
+            MNN_PRINT("KAISWEEP,%s,%d,%d,%d,%d,%.5f\n", engTag, (int)m, (int)n, (int)k, (int)blkSize,
+                      (double)_pt.durationInUs() / 1000.0 / kaiRep);
+        }
+    } else {
+        // Hybrid path: pack lhs once per slot (different mr => different packed layout), then run the
+        // SME kernel on thread 0 over columns [0, nSme) concurrently with NEON kernels on the
+        // remaining threads over columns [nSme, n).
+        auto lhsPackedSme  = mTempIm2ColBuffer->host<int8_t>();
+        auto lhsPackedNeon = mTempIm2ColBufferNeon->host<int8_t>();
+        packLhs(mUkernel, mParam, lhsPackedSme);
+        packLhs(mUkernelNeon, mParamNeon, lhsPackedNeon);
+        auto rhsPackedSme  = mWeightInt8->host<uint8_t>();
+        auto rhsPackedNeon = mWeightInt8Neon->host<uint8_t>();
+        size_t nStepNeon = getNStep(mParamNeon);
+        int vecPerNeon = getVecNumPerThread(nNeon, neonThreads, nStepNeon);
+        // TEMP bench hook: MNN_KAI_PROF=1 times the concurrent hybrid matmul only (packLhs excluded,
+        // done once above), MNN_KAI_REP=N repeats for a stable median. Prints the chosen N-split.
+        static const char* kaiProfH = getenv("MNN_KAI_PROF");
+        static const char* kaiRepEnvH = getenv("MNN_KAI_REP");
+        int kaiRepH = (kaiProfH != nullptr && kaiRepEnvH != nullptr) ? atoi(kaiRepEnvH) : 1;
+        if (kaiRepH < 1) { kaiRepH = 1; }
+        MNN::Timer _pth;
+        for (int rep = 0; rep < kaiRepH; ++rep) {
+        MNN_CONCURRENCY_BEGIN(tId, threadNum) {
+            int t = (int)tId;
+            if (t == 0) {
+                // SME slot: columns [0, nSme).
+                runMatmul(mUkernel, mParam, m, nSme, k, blkSize, lhsPackedSme, rhsPackedSme,
+                          dst, n * elementSize, elementSize, postPtr[3], postPtr[2]);
+            } else {
+                // NEON slot: columns [nSme, n) split among neonThreads.
+                int neonId = t - 1;
+                int localStart = neonId * vecPerNeon;
+                if (localStart < (int)nNeon) {
+                    int vecNum = (localStart + vecPerNeon > (int)nNeon) ? ((int)nNeon - localStart) : vecPerNeon;
+                    size_t globalStart = nSme + (size_t)localStart;
+                    auto threadRhsPacked = rhsPackedNeon + getRhsPackedOffset(mUkernelNeon, mParamNeon, globalStart, k, blkSize);
+                    auto threadDst = dst + getDstOffset(0, globalStart, n, elementSize);
+                    runMatmul(mUkernelNeon, mParamNeon, m, vecNum, k, blkSize, lhsPackedNeon, threadRhsPacked,
+                              threadDst, n * elementSize, elementSize, postPtr[3], postPtr[2]);
+                }
+            }
+        }
+        MNN_CONCURRENCY_END();
+        }
+        if (kaiProfH != nullptr) {
+            MNN_PRINT("KAIHYB,%d,%d,%d,%d,%d,%d,%.5f\n", (int)m, (int)n, (int)k, (int)blkSize,
+                      (int)nSme, (int)nNeon, (double)_pth.durationInUs() / 1000.0 / kaiRepH);
+        }
+    }
 
     if(outputDes->dimensionFormat != MNN_DATA_FORMAT_NHWC) {
         // Convert output from NHWC format to original format.

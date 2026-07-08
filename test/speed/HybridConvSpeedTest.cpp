@@ -536,9 +536,114 @@ public:
     }
 };
 
+// Focused correctness test for the SYMMETRIC per-channel int4 path
+// (KleidiAIConvInt8::QI4_SYM_PERCHANNEL_F32). The mixedKernel test only exercises
+// asymmetric weights (async=true), so the symmetric rhs-pack + qai8dxp_qsi4cxp
+// matmul is never covered there. This builds symmetric int4 weights directly
+// (async=false, one scale per output channel, block=0) and compares against a
+// dequantized fp32 reference. batch=1 hits the deterministic GEMV (sdot) kernel;
+// larger batches hit the GEMM path. Symmetric int4 only has an f32 ukernel, so the
+// KleidiAI path is active at precision=1; at precision=2 it falls back to the
+// generic conv, which still validates the reference.
+class ConvInt8SymKernelTest : public HybridConvSpeedTestCommon {
+protected:
+    static bool testKernelSym(std::string title, INTS inputShape, INTS kernel, INTS channel, INTS pad,
+                              INTS strides, INTS dilate, int batch, int precision) {
+        const int nbit = 4;
+        const int threshold = (1 << (nbit - 1)) - 1; // 7
+        const int clampMinI = -(1 << (nbit - 1));    // -8
+        int ic = channel[0], oc = channel[1];
+        int iw = inputShape[0], ih = inputShape[1];
+        int area = kernel[0] * kernel[1];
+        int kernelSize = ic * area;
+
+        std::vector<float> weightFp32(oc * kernelSize);
+        std::vector<float> bias(oc), biasdup(oc);
+        std::vector<float> wScale(oc); // symmetric: one scale per output channel (block=0)
+
+        VARP x = _Input({batch, ic, ih, iw}, NCHW, halide_type_of<float>());
+        auto xInfo = x->getInfo();
+        auto xPtr = x->writeMap<float>();
+        for (int i = 0; i < xInfo->size; ++i) {
+            xPtr[i] = ((i % 255) - 127) * 0.017f;
+        }
+        x = _Convert(x, NC4HW4);
+
+        for (int i = 0; i < oc; ++i) {
+            bias[i] = i % 10 + 0.005f;
+            for (int j = 0; j < kernelSize; ++j) {
+                weightFp32[i * kernelSize + j] = ((i * kernelSize + j) % 10) * 0.23f + 0.05f;
+            }
+        }
+        biasdup = bias;
+
+        // Per-channel symmetric quant: alpha = maxAbs / 7; dequant reference w' = q * alpha.
+        auto newWeightFp32 = weightFp32;
+        for (int k = 0; k < oc; ++k) {
+            float absMax = 1e-7f;
+            for (int j = 0; j < kernelSize; ++j) {
+                absMax = fmaxf(absMax, fabsf(weightFp32[k * kernelSize + j]));
+            }
+            float alpha = absMax / (float)threshold;
+            wScale[k] = alpha;
+            for (int j = 0; j < kernelSize; ++j) {
+                int q = (int)roundf(weightFp32[k * kernelSize + j] / alpha);
+                q = std::max(std::min(q, threshold), clampMinI);
+                newWeightFp32[k * kernelSize + j] = q * alpha;
+            }
+        }
+
+        // async=false => symmetric encoding (one scale per channel).
+        auto y = _HybridConv(weightFp32, std::move(bias), std::move(wScale), x, channel, kernel,
+                             PaddingMode::CAFFE, strides, dilate, 1, pad, false, false, nbit, false);
+        auto yfp32 = _Conv(std::move(newWeightFp32), std::move(biasdup), x, {ic, oc}, kernel,
+                           PaddingMode::CAFFE, strides, dilate, 1, pad);
+        y = _Convert(y, NCHW);
+        yfp32 = _Convert(yfp32, NCHW);
+        auto yPtr = y->readMap<float>();
+        auto tgPtr = yfp32->readMap<float>();
+        auto elesize = yfp32->getInfo()->size;
+        float maxValue = 0.001f;
+        for (int i = 0; i < elesize; ++i) {
+            maxValue = fmaxf(maxValue, fabsf(tgPtr[i]));
+        }
+        for (int i = 0; i < elesize; ++i) {
+            float ratio = fabsf(tgPtr[i] - yPtr[i]) / maxValue;
+            if (ratio > 0.1f) {
+                MNN_PRINT("%d sym result Error ratio=%f: right=%f, error=%f\n", i, ratio, tgPtr[i], yPtr[i]);
+                MNN_PRINT("sym conv info: batch=%d ic=%d oc=%d\n", batch, ic, oc);
+                return false;
+            }
+        }
+        return true;
+    }
+public:
+    virtual bool run(int precision) {
+        INTS strides = {1, 1}, dilate = {1, 1}, pad = {0, 0};
+        INTS kernel = {1, 1}, inputShape = {1, 1};
+        // ic must be even (isSupported); include oc tails (130, 138) to cover n%nr != 0.
+        std::vector<std::vector<int>> channels = {
+            {64, 64}, {128, 256}, {256, 128}, {512, 512}, {1536, 1536},
+            {1536, 8960}, {8960, 1536}, {896, 896}, {2048, 130}, {200, 138}};
+        std::vector<int> batches = {1, 4, 100};
+        for (auto& channel : channels) {
+            for (auto batch : batches) {
+                if (!testKernelSym("KleidiAI sym int4:", inputShape, kernel, channel, pad, strides, dilate,
+                                   batch, precision)) {
+                    MNN_ERROR("Error: KleidiAI sym int4 ic=%d oc=%d batch=%d precision=%d\n",
+                              channel[0], channel[1], batch, precision);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+};
+
 MNNTestSuiteRegister(DenseConvInt8Test, "op/lowMemory/DenseConv");
 MNNTestSuiteRegister(HybridConvInt8Test, "op/lowMemory/HybridConv");
 MNNTestSuiteRegister(HybridConvSpeedInt8Test, "speed/HybridConv");
 MNNTestSuiteRegister(ConvInt8BlockQuantTest, "op/lowMemory/blockConv");
 MNNTestSuiteRegister(ConvInt8MixedKernelTest, "op/lowMemory/mixedKernel");
+MNNTestSuiteRegister(ConvInt8SymKernelTest, "op/lowMemory/symKernel");
 MNNTestSuiteRegister(LowBitScaleTest, "op/lowMemory/lowBitScale");

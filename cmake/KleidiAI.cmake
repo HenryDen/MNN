@@ -108,6 +108,7 @@ function (download_kleidiai_and_collect_sources)
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/
+        ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qai4c32p/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/
@@ -120,6 +121,7 @@ function (download_kleidiai_and_collect_sources)
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/dwconv/dwconv_f32_f32_f32p/)
 
     file(GLOB kleidiai_pack_sources
+        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_pack_f16pmrx4_f32_neon.c"
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32pscalef32_f16_neon.c"
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32pscalef32_f32_neon.c"
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4cxps1s0_qsu4cxs1s0_neon.c"
@@ -222,6 +224,12 @@ function (download_kleidiai_and_collect_sources)
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*dot_asm.S"
     )
     list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f32_qsi8d32p_qai4c32p_sme2_sources})
+
+    file(GLOB matmul_clamp_f32_f16p_qai4c32p_sme2_sources
+        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qai4c32p/*mopa.c"
+        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qai4c32p/*mopa_asm.S"
+    )
+    list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f32_f16p_qai4c32p_sme2_sources})
 
     file(GLOB dwconv_pack_sources
         "${KLEIDIAI_SRC_DIR}/kai/ukernels/dwconv/pack/*.c"
