@@ -865,6 +865,8 @@ ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const 
             doHybrid = false;
         }
     }
+    static const char* kaiBreakdownEnv = getenv("MNN_KAI_BREAKDOWN");
+    const bool kaiBreakdown = kaiBreakdownEnv != nullptr && kaiBreakdownEnv[0] != '\0' && kaiBreakdownEnv[0] != '0';
 
     if (!doHybrid) {
         // Single-slot path: SME-only on one thread (SME prefers a single thread for better
@@ -914,8 +916,14 @@ ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const 
         // remaining threads over columns [nSme, n).
         auto lhsPackedSme  = mTempIm2ColBuffer->host<int8_t>();
         auto lhsPackedNeon = mTempIm2ColBufferNeon->host<int8_t>();
+        double packSmeUs = 0.0;
+        double packNeonUs = 0.0;
+        MNN::Timer packTimer;
         packLhs(mUkernel, mParam, lhsPackedSme);
+        packSmeUs = (double)packTimer.durationInUs();
+        packTimer.reset();
         packLhs(mUkernelNeon, mParamNeon, lhsPackedNeon);
+        packNeonUs = (double)packTimer.durationInUs();
         auto rhsPackedSme  = mWeightInt8->host<uint8_t>();
         auto rhsPackedNeon = mWeightInt8Neon->host<uint8_t>();
         size_t nStepNeon = getNStep(mParamNeon);
@@ -953,6 +961,17 @@ ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const 
         if (kaiProfH != nullptr) {
             MNN_PRINT("KAIHYB,%d,%d,%d,%d,%d,%d,%.5f\n", (int)m, (int)n, (int)k, (int)blkSize,
                       (int)nSme, (int)nNeon, (double)_pth.durationInUs() / 1000.0 / kaiRepH);
+        }
+        if (kaiBreakdown) {
+            const double matmulUs = (double)_pth.durationInUs() / (double)kaiRepH;
+            const double packTotalUs = packSmeUs + packNeonUs;
+            const double totalUs = packTotalUs + matmulUs;
+            const double packPct = totalUs > 0.0 ? packTotalUs * 100.0 / totalUs : 0.0;
+            const double matmulPct = totalUs > 0.0 ? matmulUs * 100.0 / totalUs : 0.0;
+            MNN_PRINT("KAIHYBBD,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f\n",
+                      (int)m, (int)n, (int)k, (int)blkSize, (int)nSme, (int)nNeon,
+                      packSmeUs / 1000.0, packNeonUs / 1000.0, packTotalUs / 1000.0,
+                      matmulUs / 1000.0, packPct, matmulPct);
         }
     }
 
