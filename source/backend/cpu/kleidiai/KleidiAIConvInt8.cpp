@@ -18,7 +18,7 @@
 #include "backend/cpu/CPURuntime.hpp"
 #include "core/Concurrency.h"
 #include "core/TensorUtils.hpp"
-#include "backend/cpu/CPUTensorConvert.hpp"
+#include "KleidiAICommon.hpp"
 
 // KleidiAI micro-kernel headers (int4 / int8 dynamic-quant matmul + packing).
 // The symmetric per-channel int4 path is served by the asymmetric qsi8d32/qai4c32
@@ -894,7 +894,7 @@ ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const 
     if(inputDes->dimensionFormat != MNN_DATA_FORMAT_NHWC) {
         // Convert input to NHWC format.
         MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-            CPUTensorConverter::convert(input, mInputConvertBuffer.get(), core, tId, threadNum);
+            KleidiAICommon::convertLayout(input, mInputConvertBuffer.get(), core, tId, threadNum);
         };
         MNN_CONCURRENCY_END();
         lhs = mInputConvertBuffer->host<uint8_t>();
@@ -986,7 +986,7 @@ ErrorCode KleidiAIConvInt8::onExecute(const std::vector<Tensor*>& inputs, const 
     if(outputDes->dimensionFormat != MNN_DATA_FORMAT_NHWC) {
         // Convert output from NHWC format to original format.
         MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-            CPUTensorConverter::convert(mOutputConvertBuffer.get(), output, core, tId, threadNum);
+            KleidiAICommon::convertLayout(mOutputConvertBuffer.get(), output, core, tId, threadNum);
         };
         MNN_CONCURRENCY_END();
     }

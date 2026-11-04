@@ -2,6 +2,7 @@
 
 #ifdef MNN_KLEIDIAI_ENABLED
 
+#include "KleidiAICommon.hpp"
 #include <string.h>
 #include "core/Concurrency.h"
 #include "backend/cpu/compute/Int8FunctionsOpt.h"
@@ -113,11 +114,9 @@ ErrorCode KleidiAIConvolutionDepthwise::KleidiAIDepthwiseExecution::onExecute(co
     auto batch = inputTensor->batch();
 
     MNN_CONCURRENCY_BEGIN(tId, mNumber) {
-        CPUTensorConverter::convert(inputTensor, &mInputNHWC, core, tId, mNumber);
+        KleidiAICommon::convertLayout(inputTensor, &mInputNHWC, core, tId, mNumber);
     }
     MNN_CONCURRENCY_END();
-
-    //CPUTensorConverter::convert(inputTensor, &mInputNHWC, core);
 
     constexpr size_t rows_handled = 4;  // no of rows kernel handles each time.
     for(size_t b = 0; b < batch; b++)  {
@@ -157,10 +156,9 @@ ErrorCode KleidiAIConvolutionDepthwise::KleidiAIDepthwiseExecution::onExecute(co
     }
 
     MNN_CONCURRENCY_BEGIN(tId, mNumber) {
-       CPUTensorConverter::convert(&mOutputNHWC, outputTensor, core, tId, mNumber);
+    KleidiAICommon::convertLayout(&mOutputNHWC, outputTensor, core, tId, mNumber);
     }
     MNN_CONCURRENCY_END();
-    //CPUTensorConverter::convert(&mOutputNHWC, outputTensor, core);
     return NO_ERROR;
 }
 

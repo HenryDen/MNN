@@ -29,9 +29,9 @@ function (download_kleidiai_and_collect_sources)
     # Disable the KleidiAI tests
     set(KLEIDIAI_BUILD_TESTS OFF)
 
-    set(KLEIDIAI_COMMIT_SHA "1.16.0")
-    set(KLEIDIAI_DOWNLOAD_URL "https://github.com/ARM-software/kleidiai/archive/refs/tags/v${KLEIDIAI_COMMIT_SHA}.tar.gz")
-    set(KLEIDIAI_ARCHIVE_MD5 "0a9e9008adb6031f9e8cf70dff4a3321")
+    set(KLEIDIAI_COMMIT_SHA "1.32.0")
+    set(KLEIDIAI_DOWNLOAD_URL "https://github.com/ARM-software/kleidiai/releases/download/v${KLEIDIAI_COMMIT_SHA}/kleidiai-v${KLEIDIAI_COMMIT_SHA}-src.tar.gz")
+    set(KLEIDIAI_ARCHIVE_SHA256 "a48d373e7c5d721a0aecbf5ddaf0bdf245bc8064e6b84086f13db0e102b553a6")
 
     set(_kleidiai_src_dir "")
     if(DEFINED KLEIDIAI_SRC_DIR AND EXISTS "${KLEIDIAI_SRC_DIR}")
@@ -44,7 +44,7 @@ function (download_kleidiai_and_collect_sources)
         set(_deps_dir "${CMAKE_CURRENT_BINARY_DIR}/_deps")
         file(MAKE_DIRECTORY "${_deps_dir}")
 
-        set(_tar_path "${_deps_dir}/v${KLEIDIAI_COMMIT_SHA}.tar.gz")
+        set(_tar_path "${_deps_dir}/kleidiai-v${KLEIDIAI_COMMIT_SHA}-src.tar.gz")
 
         file(
             DOWNLOAD "${KLEIDIAI_DOWNLOAD_URL}" "${_tar_path}"
@@ -58,8 +58,8 @@ function (download_kleidiai_and_collect_sources)
             return()
         endif()
 
-        file(MD5 "${_tar_path}" _actual_md5)
-        if(NOT _actual_md5 STREQUAL "${KLEIDIAI_ARCHIVE_MD5}")
+        file(SHA256 "${_tar_path}" _actual_sha256)
+        if(NOT _actual_sha256 STREQUAL "${KLEIDIAI_ARCHIVE_SHA256}")
             message(WARNING "KleidiAI archive hash mismatch. Building without KleidiAI.")
             return()
         endif()
@@ -73,7 +73,7 @@ function (download_kleidiai_and_collect_sources)
             return()
         endif()
 
-        set(_kleidiai_src_dir "${_deps_dir}/kleidiai-${KLEIDIAI_COMMIT_SHA}")
+        set(_kleidiai_src_dir "${_deps_dir}/kleidiai-v${KLEIDIAI_COMMIT_SHA}")
         if(NOT EXISTS "${_kleidiai_src_dir}/kai")
             message(WARNING "KleidiAI source tree not found at expected location. Building without KleidiAI.")
             return()
@@ -83,6 +83,8 @@ function (download_kleidiai_and_collect_sources)
             "${_kleidiai_src_dir}"
             CACHE PATH "Path to KleidiAI source (downloaded or provided)" FORCE)
     endif()
+
+    message(STATUS "KleidiAI source: ${_kleidiai_src_dir} (default release v${KLEIDIAI_COMMIT_SHA})")
 
     set(MNN_KLEIDIAI_DIR "${_MNN_KLEIDIAI_CMAKE_LIST_DIR}/../source/backend/cpu/kleidiai")
     if(NOT EXISTS "${MNN_KLEIDIAI_DIR}/KleidiAIConvInt8.cpp")
@@ -95,11 +97,107 @@ function (download_kleidiai_and_collect_sources)
                             "includes source/backend/cpu/kleidiai, or pass -DMNN_KLEIDIAI=OFF.")
     endif()
     set(MNN_KLEIDIAI_INTEGRATION_SOURCES
+        ${MNN_KLEIDIAI_DIR}/KleidiAICommon.cpp
         ${MNN_KLEIDIAI_DIR}/KleidiAIConvolution.cpp
         ${MNN_KLEIDIAI_DIR}/KleidiAIConvolutionDepthwise.cpp
         ${MNN_KLEIDIAI_DIR}/KleidiAIConvInt8.cpp
         ${MNN_KLEIDIAI_DIR}/KleidiAIDenseConvolution.cpp)
     list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_INTEGRATION_SOURCES})
+
+    # All nine static signed-INT8 kernels are one optional extension. Source availability
+    # and MNN_SME2 are compile gates; CoreFunctions::supportSME2 is the runtime ISA gate.
+    set(_static_int8_kernels
+        matmul/pack/kai_lhs_pack_x8p2vlx4_x8_sme
+        matmul/pack/kai_lhs_imatmul_pack_x8p2vlx4_x8p_sme
+        matmul/pack/kai_matmul_pack_lhs_mxk_x8p4vsx4_x8_sme
+        matmul/pack/kai_rhs_pack_nxk_qsi4cxp8vsx4sf32bi32_qsi4cx_f32_i32_sme
+        matmul/pack/kai_rhs_pack_nxk_qsi4cxp8vsx4sf32bi32_qsx4cx_f32_i32_sme
+        matmul/pack/kai_matmul_pack_rhs_nxk_qsu2cxp16vsx4sf32bi32_qsu2cx_f32_i32_sme
+        matmul/pack/kai_matmul_pack_rhs_kxn_qsi8cxp4vsx4bi32sf32_qsi8_i32_f32_sme
+        matmul/pack/kai_rhs_pack_kxn_qsi8cxp2vlx4sb_qs8cx_f32_i32_sme
+        matmul/pack/kai_rhs_imatmul_pack_kxn_qsi8cxp2vlx4sb_qs8cx_f32_i32_sme
+        matmul/matmul_clamp_qai8_qai8_qsi4cxp/kai_matmul_clamp_qai8_qai8_qsi4cxp8vsx4sf32bi32_1x64vs_sme2_dot
+        matmul/matmul_clamp_qai8_qai8p_qsi4cxp/kai_matmul_clamp_qai8_qai8p8vsx4_qsi4cxp8vsx4sf32bi32_8vsx8vs_sme2_mopa
+        matmul/matmul_clamp_qai8_qai8_qsu2cxp/kai_matmul_clamp_qai8_qai8_qsu2cxp16vsx4sf32bi32_1x64vs_sme2_dot
+        matmul/matmul_clamp_qai8_qai8p_qsu2cxp/kai_matmul_clamp_qai8_qai8p8vsx4_qsu2cxp16vsx4sf32bi32_8vsx16vs_sme2_mopa
+        matmul/matmul_clamp_qai8_qai8_qsi8cxp/kai_matmul_clamp_qai8_qai8_qsi8cxp4vsx4bi32sf32_1x32vs_sme2_dot
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p4vsx4_qsi8cxp4vsx4bi32sf32_8vsx8vs_sme2_mopa
+        matmul/matmul_clamp_qai8_qai8_qsi8cxp/kai_matmul_clamp_qai8_qai8_qsi8cxp2vlx4sb_1x16vl_sme2_dot
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p2vlx4_qsi8cxpsb2vlx4_2vlx2vl_sme2_mopa
+        matmul/imatmul_clamp_qai8_qai8p_qsi8cxp/kai_imatmul_clamp_qai8_qai8p2vlx4_qsi8cxpsb2vlx4_2vlx2vl_sme2_mopa)
+    # The new W8 C wrappers call six MOPA tiles (including edges).
+    # Several packers also call ASM whose basename differs from their C wrapper.
+    set(_static_int8_asm
+        matmul/pack/kai_lhs_pack_x8p2vlx4_x8_sme_asm
+        matmul/pack/kai_lhs_imatmul_pack_x8p2vlx4_x8p_sme_asm
+        matmul/pack/kai_matmul_pack_rows_x8p4vsx4_x8_sme_asm
+        matmul/pack/kai_matmul_pack_rhs_kxn_qsi8cxp4vsx4bi32sf32_qsi8_i32_f32_sme_asm
+        matmul/pack/kai_rhs_pack_kxn_qsi8cxp2vlx4sb_qs8cx_f32_i32_sme_asm
+        matmul/pack/kai_rhs_imatmul_pack_kxn_qsi8cxp2vlx4sb_qs8cx_f32_i32_sme_asm
+        matmul/matmul_clamp_qai8_qai8_qsi4cxp/kai_matmul_clamp_qai8_qai8_qsi4cxp8vsx4sf32bi32_1x64vs_sme2_dot_asm
+        matmul/matmul_clamp_qai8_qai8p_qsi4cxp/kai_matmul_clamp_qai8_qai8p8vsx4_qsi4cxp8vsx4sf32bi32_8vsx8vs_sme2_mopa_asm
+        matmul/matmul_clamp_qai8_qai8_qsu2cxp/kai_matmul_clamp_qai8_qai8_qsu2cxp16vsx4sf32bi32_1x64vs_sme2_dot_asm
+        matmul/matmul_clamp_qai8_qai8p_qsu2cxp/kai_matmul_clamp_qai8_qai8p8vsx4_qsu2cxp16vsx4sf32bi32_8vsx16vs_sme2_mopa_asm
+        matmul/matmul_clamp_qai8_qai8_qsi8cxp/kai_matmul_clamp_qai8_qai8_qsi8cxp4vsx4bi32sf32_1x32vs_sme2_dot_asm
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p4vsx4_qsi8cxp4vsx4bi32sf32_4vsx4vs_sme2_mopa_asm
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p4vsx4_qsi8cxp4vsx4bi32sf32_4vsx8vs_sme2_mopa_asm
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p4vsx4_qsi8cxp4vsx4bi32sf32_4vsx16vs_sme2_mopa_asm
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p4vsx4_qsi8cxp4vsx4bi32sf32_8vsx4vs_sme2_mopa_asm
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p4vsx4_qsi8cxp4vsx4bi32sf32_8vsx8vs_sme2_mopa_asm
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p4vsx4_qsi8cxp4vsx4bi32sf32_16vsx4vs_sme2_mopa_asm
+        matmul/matmul_clamp_qai8_qai8_qsi8cxp/kai_matmul_clamp_qai8_qai8_qsi8cxp2vlx4sb_1x16vl_sme2_dot_asm
+        matmul/matmul_clamp_qai8_qai8p_qsi8cxp/kai_matmul_clamp_qai8_qai8p2vlx4_qsi8cxpsb2vlx4_2vlx2vl_sme2_mopa_asm
+        matmul/imatmul_clamp_qai8_qai8p_qsi8cxp/kai_imatmul_clamp_qai8_qai8p2vlx4_qsi8cxpsb2vlx4_2vlx2vl_sme2_mopa_asm)
+    set(_have_static_int8 TRUE)
+    foreach(_kernel ${_static_int8_kernels})
+        if(NOT EXISTS "${KLEIDIAI_SRC_DIR}/kai/ukernels/${_kernel}.c")
+            set(_have_static_int8 FALSE)
+        endif()
+    endforeach()
+    foreach(_kernel ${_static_int8_asm})
+        if(NOT EXISTS "${KLEIDIAI_SRC_DIR}/kai/ukernels/${_kernel}.S")
+            set(_have_static_int8 FALSE)
+        endif()
+    endforeach()
+    set(_static_int8_headers
+        kai/kai_common.h
+        kai/kai_common_sme_asm.S
+        kai/ukernels/matmul/kai_matmul.h
+        kai/ukernels/matmul/kai_matmul_types.h
+        kai/ukernels/matmul/kai_matmul_pack_lhs.h
+        kai/ukernels/matmul/kai_matmul_pack_lhs_types.h
+        kai/ukernels/matmul/kai_matmul_pack_rhs.h
+        kai/ukernels/matmul/kai_matmul_pack_rhs_types.h)
+    foreach(_kernel ${_static_int8_kernels})
+        # New API wrappers use the shared headers; legacy wrappers use matching headers.
+        if(_kernel MATCHES "2vlx4")
+            list(APPEND _static_int8_headers "kai/ukernels/${_kernel}.h")
+        endif()
+    endforeach()
+    foreach(_header ${_static_int8_headers})
+        if(NOT EXISTS "${KLEIDIAI_SRC_DIR}/${_header}")
+            set(_have_static_int8 FALSE)
+        endif()
+    endforeach()
+    if(NOT MNN_SME2)
+        set(_have_static_int8 FALSE)
+    endif()
+    if(_have_static_int8)
+        add_definitions(-DMNN_KLEIDIAI_STATIC_INT8=1)
+        set(_static_int8_adapters
+            ${MNN_KLEIDIAI_DIR}/KleidiAIStaticConvInt8.cpp
+            ${MNN_KLEIDIAI_DIR}/KleidiAIStaticInt8Kernels.cpp)
+        list(APPEND MNN_KLEIDIAI_INTEGRATION_SOURCES ${_static_int8_adapters})
+        list(APPEND MNN_SOURCES_KLEIDIAI ${_static_int8_adapters})
+        foreach(_kernel ${_static_int8_kernels})
+            list(APPEND KLEIDIAI_FILES_SME2 "${KLEIDIAI_SRC_DIR}/kai/ukernels/${_kernel}.c")
+        endforeach()
+        foreach(_kernel ${_static_int8_asm})
+            list(APPEND KLEIDIAI_FILES_SME2 "${KLEIDIAI_SRC_DIR}/kai/ukernels/${_kernel}.S")
+        endforeach()
+    elseif(MNN_SME2)
+        message(STATUS "KleidiAI static INT8 disabled: source override lacks the complete v1.32 extension")
+    endif()
 
     include_directories(${MNN_KLEIDIAI_DIR})
 
@@ -122,113 +220,60 @@ function (download_kleidiai_and_collect_sources)
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/dwconv/pack/
         ${KLEIDIAI_SRC_DIR}/kai/ukernels/dwconv/dwconv_f32_f32_f32p/)
 
-    file(GLOB kleidiai_pack_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32pscalef32_f16_neon.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32pscalef32_f32_neon.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4cxps1s0_qsu4cxs1s0_neon.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qai4c32p_qau4c32s0s1_f32_f32_f32_neon.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.c"
-    )
-    list(APPEND KLEIDIAI_FILES_NEON ${kleidiai_pack_sources})
-
-    file(GLOB matmul_clamp_f32_qai8dxp_qsi4cxp_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*dotprod.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*i8mm.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*dotprod_asm.S"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*i8mm_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_NEON ${matmul_clamp_f32_qai8dxp_qsi4cxp_sources})
-
-    file(GLOB matmul_clamp_f16_qsi8d32p_qai4c32p_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*dotprod.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*i8mm.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*dotprod_asm.S"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*i8mm_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_NEON ${matmul_clamp_f16_qsi8d32p_qai4c32p_sources})
-
-    file(GLOB matmul_clamp_f32_qsi8d32p_qai4c32p_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*dotprod.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*i8mm.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*dotprod_asm.S"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*i8mm_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_NEON ${matmul_clamp_f32_qsi8d32p_qai4c32p_sources})
+    # Compile only kernels used by MNN. New upstream kernels may require newer
+    # compiler ISA support even when runtime dispatch would never select them.
+    set(_neon_kernels
+        matmul/pack/kai_lhs_quant_pack_qsi8d32pscalef32_f16_neon
+        matmul/pack/kai_lhs_quant_pack_qsi8d32pscalef32_f32_neon
+        matmul/pack/kai_rhs_pack_nxk_qai4c32p_qau4c32s0s1_f32_f32_f32_neon
+        matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/kai_matmul_clamp_f16_qsi8d32p1x8_qai4c32p4x8_1x4_neon_dotprod
+        matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/kai_matmul_clamp_f16_qsi8d32p4x8_qai4c32p4x8_8x4_neon_i8mm
+        matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qai4c32p4x8_1x4_neon_dotprod
+        matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qai4c32p4x8_8x4_neon_i8mm)
+    set(_sme_kernels
+        matmul/pack/kai_rhs_pack_nxk_qai4c32ps1s0nrx4_qau4c32s0s1_f32_f32_f32_neon
+        matmul/pack/kai_lhs_pack_f32p2vlx1_f32_sme
+        matmul/pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme
+        matmul/pack/kai_lhs_pack_x16p2vlx2_x16_sme
+        matmul/pack/kai_rhs_pack_nxk_x16p2vlx2b_x16_x16_sme
+        matmul/pack/kai_lhs_imatmul_pack_x32p2vlx1_x32p_sme
+        matmul/pack/kai_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme
+        matmul/pack/kai_lhs_imatmul_pack_x16p2vlx2_x16p_sme
+        matmul/pack/kai_rhs_imatmul_pack_kxn_x16p2vlx2b_x16_x16_sme
+        matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa
+        matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p2vlx1b_1x16vl_sme2_mla
+        matmul/matmul_clamp_f16_f16p_f16p/kai_matmul_clamp_f16_f16p2vlx2_f16p2vlx2_2vlx2vl_sme2_mopa
+        matmul/matmul_clamp_f16_f16_f16p/kai_matmul_clamp_f16_f16_f16p2vlx2b_1x16vl_sme2_dot
+        matmul/imatmul_clamp_f32_f32p_f32p/kai_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa
+        matmul/imatmul_clamp_f16_f16p_f16p/kai_imatmul_clamp_f16_f16p2vlx2_f16p2vlx2_2vlx2vl_sme2_mopa
+        matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/kai_matmul_clamp_f16_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa
+        matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/kai_matmul_clamp_f16_qsi8d32p1x4_qai4c32p4vlx4_1x4vl_sme2_dot
+        matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/kai_matmul_clamp_f32_qsi8d32p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa
+        matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/kai_matmul_clamp_f32_qsi8d32p1x4_qai4c32p4vlx4_1x4vl_sme2_dot
+        dwconv/pack/kai_rhs_dwconv_pack_x32p1vlx1b_x32_x32_sme
+        dwconv/dwconv_f32_f32_f32p/kai_dwconv_clamp_f32_f32_f32p1vlx1b_3x3_s1_4xc_sme2_mla)
+    foreach(_isa NEON SME2)
+        if(_isa STREQUAL "NEON")
+            set(_kernels ${_neon_kernels})
+        else()
+            set(_kernels ${_sme_kernels})
+        endif()
+        foreach(_kernel ${_kernels})
+            set(_base "${KLEIDIAI_SRC_DIR}/kai/ukernels/${_kernel}")
+            if(NOT EXISTS "${_base}.c")
+                message(FATAL_ERROR "Required KleidiAI kernel missing: ${_base}.c")
+            endif()
+            list(APPEND KLEIDIAI_FILES_${_isa} "${_base}.c")
+            if(EXISTS "${_base}_asm.S")
+                list(APPEND KLEIDIAI_FILES_${_isa} "${_base}_asm.S")
+            endif()
+        endforeach()
+    endforeach()
     list(APPEND MNN_SOURCES_KLEIDIAI ${KLEIDIAI_FILES_NEON})
+    list(APPEND KLEIDIAI_FILES_SME2 "${KLEIDIAI_SRC_DIR}/kai/kai_common_sme_asm.S")
 
-    file(GLOB sme_pack_sources
-        ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/*_sme.c
-        ${KLEIDIAI_SRC_DIR}/kai/*_sme_asm.S
-        ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/*_sme_asm.S
-        ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qai4c32ps1s0nrx4_qau4c32s0s1_f32_f32_f32_neon.c
-        ${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qai4c32ps1s0nrx4_qau4c32s1s0_f32_f32_f32_neon.c
-
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${sme_pack_sources})
-
-    file(GLOB matmul_clamp_f32_f32p_f32p_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/*mopa.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/*mopa_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f32_f32p_f32p_sources})
-
-    file(GLOB matmul_clamp_f32_f32_f32p_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/*sme2_mla.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/*sme2_mla_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f32_f32_f32p_sources})
-
-    file(GLOB matmul_clamp_f16_f16p_f16p_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_f16p_f16p/*mopa.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_f16p_f16p/*mopa_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f16_f16p_f16p_sources})
-
-    file(GLOB matmul_clamp_f16_f16_f16p_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_f16_f16p/*sme2_dot.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_f16_f16p/*sme2_dot_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f16_f16_f16p_sources})
-
-    file(GLOB matmul_clamp_f32_qai8dxp_qsi4cxp_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*mopa.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*mopa_asm.S"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*sdot.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/*sdot_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f32_qai8dxp_qsi4cxp_sources})
-
-    file(GLOB imatmul_clamp_f32_f32p_f32p_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/imatmul_clamp_f32_f32p_f32p/*mopa.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/imatmul_clamp_f32_f32p_f32p/*mopa_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${imatmul_clamp_f32_f32p_f32p_sources})
-
-    file(GLOB imatmul_clamp_f16_f16p_f16p_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/imatmul_clamp_f16_f16p_f16p/*mopa.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/imatmul_clamp_f16_f16p_f16p/*mopa_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${imatmul_clamp_f16_f16p_f16p_sources})
-
-    file(GLOB matmul_clamp_f16_qsi8d32p_qai4c32p_sme2_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*mopa.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*mopa_asm.S"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*dot.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f16_qsi8d32p_qai4c32p/*dot_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f16_qsi8d32p_qai4c32p_sme2_sources})
-
-    file(GLOB matmul_clamp_f32_qsi8d32p_qai4c32p_sme2_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*mopa.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*mopa_asm.S"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*dot.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qai4c32p/*dot_asm.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${matmul_clamp_f32_qsi8d32p_qai4c32p_sme2_sources})
-
-    # The direct FP32 -> packed FP16 int4 path is not in the pinned 1.16.0
-    # release. Enable it only for a supplied source tree containing the complete
+    # This legacy direct FP32 -> packed FP16 int4 API is not in stock releases.
+    # Enable it only for a supplied source tree containing the complete
     # extension; stock releases retain the supported dynamic-quant SME path.
     set(_direct_pack "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/pack/kai_lhs_pack_f16pmrx4_f32_neon")
     set(_direct_matmul "${KLEIDIAI_SRC_DIR}/kai/ukernels/matmul/matmul_clamp_f32_f16p_qai4c32p/kai_matmul_clamp_f32_f16p1vlx4_qai4c32p4vlx4_1vlx4vl_sme2_mopa")
@@ -240,17 +285,6 @@ function (download_kleidiai_and_collect_sources)
         set_property(SOURCE "${MNN_KLEIDIAI_DIR}/KleidiAIConvInt8.cpp" APPEND PROPERTY
             COMPILE_DEFINITIONS MNN_KLEIDIAI_F16_PACKED_INT4=1)
     endif()
-
-    file(GLOB dwconv_pack_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/dwconv/pack/*.c"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${dwconv_pack_sources})
-
-    file(GLOB dwconv_f32_f32_f32p_sme2_sources
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/dwconv/dwconv_f32_f32_f32p/*.c"
-        "${KLEIDIAI_SRC_DIR}/kai/ukernels/dwconv/dwconv_f32_f32_f32p/*.S"
-    )
-    list(APPEND KLEIDIAI_FILES_SME2 ${dwconv_f32_f32_f32p_sme2_sources})
 
     set_source_files_properties(
         ${MNN_KLEIDIAI_INTEGRATION_SOURCES}
@@ -264,6 +298,12 @@ function (download_kleidiai_and_collect_sources)
         ${KLEIDIAI_FILES_SME2}
         PROPERTIES COMPILE_OPTIONS
                    "-fno-tree-vectorize;-march=armv8.2-a+sve+sve2")
+
+    if(CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND CMAKE_C_COMPILER_VERSION VERSION_LESS 17)
+        # AppleClang 16 crashes selecting SLP-generated SVE unpack operations in the new W8 wrappers.
+        # The arithmetic microkernels are handwritten ASM and are unaffected by this restriction.
+        set_property(SOURCE ${KLEIDIAI_FILES_SME2} APPEND PROPERTY COMPILE_OPTIONS "-fno-slp-vectorize")
+    endif()
 
     set(MNN_SOURCES_KLEIDIAI "${MNN_SOURCES_KLEIDIAI}" PARENT_SCOPE)
     set(KLEIDIAI_FILES_SME2 "${KLEIDIAI_FILES_SME2}" PARENT_SCOPE)

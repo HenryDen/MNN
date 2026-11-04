@@ -6,7 +6,7 @@
 #include "backend/cpu/compute/CommonOptFunction.h"
 #include "MNN/ErrorCode.hpp"
 #include "backend/cpu/CPUBackend.hpp"
-#include "backend/cpu/CPUTensorConvert.hpp"
+#include "KleidiAICommon.hpp"
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
 #include "core/Concurrency.h"
@@ -309,9 +309,8 @@ ErrorCode KleidiAIDenseConvolutionImpl::onResize(const std::vector<Tensor*>& inp
     mFunction.first = [=](int tId) {
         // Convert NC4HW4 to NHWC
         auto inputShape = input->shape(); // TODO check for NC4HW4, should be the NCHW
-        // CPUTensorConverter::convert(input, &mInputNHWC, core);
         MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-            CPUTensorConverter::convert(input, &mInputNHWC, core, tId, threadNum);
+            KleidiAICommon::convertLayout(input, &mInputNHWC, core, tId, threadNum);
         };
         MNN_CONCURRENCY_END();
         // Lhs packing
@@ -354,9 +353,8 @@ ErrorCode KleidiAIDenseConvolutionImpl::onResize(const std::vector<Tensor*>& inp
         }
 
         // Convert NHWC to NC4HW4
-        // CPUTensorConverter::convert(&mOutputNHWC, output, core);
         MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-            CPUTensorConverter::convert(&mOutputNHWC, output, core, tId, threadNum);
+            KleidiAICommon::convertLayout(&mOutputNHWC, output, core, tId, threadNum);
         };
         MNN_CONCURRENCY_END();
     };

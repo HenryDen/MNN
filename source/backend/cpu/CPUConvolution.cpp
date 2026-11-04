@@ -24,6 +24,9 @@
 #ifdef MNN_USE_ONEDNN
 #include "backend/cpu/OneDNNConvInt8.hpp"
 #endif
+#ifdef MNN_KLEIDIAI_STATIC_INT8
+#include "backend/cpu/kleidiai/KleidiAIStaticConvInt8.hpp"
+#endif
 
 namespace MNN {
 
@@ -356,6 +359,23 @@ public:
         // auto res = CPUConvolution::makeResourceInt8(backend, op, core->pack);
         // return new DenseConvInt8TiledExecutor(backend, op, res);
 
+#ifdef MNN_KLEIDIAI_STATIC_INT8
+        if (backend->getRuntime()->hint().enableKleidiAI) {
+            if (auto execution = KleidiAIStaticConvInt8::create(backend, op, quanCommon, inputs, outputs)) {
+                return execution;
+            }
+            // KAI fallback must expand packed INT4 before handing weights to a legacy INT8 executor.
+            if (quanCommon && quanCommon->canUseInt4 && convOp->quanParameter()->has_scaleInt() &&
+                backend->getRuntime()->hint().useCachedMmap == 0 &&
+                convOp->symmetricQuan() && convOp->symmetricQuan()->nbits() == 8 &&
+                convOp->symmetricQuan()->bias() && convOp->symmetricQuan()->scale()) {
+                quanCommon = ConvolutionCommon::load(op, backend, false, false);
+                if (!quanCommon || !quanCommon->weight.get() || quanCommon->canUseInt4) {
+                    return nullptr;
+                }
+            }
+        }
+#endif
         auto extension = core->extension;
         if (extension != nullptr && extension->createInt8GemmExecution != nullptr) {
             auto execution = extension->createInt8GemmExecution(backend, op, quanCommon, false);

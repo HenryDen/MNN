@@ -11,7 +11,7 @@
 #include "backend/cpu/CPURuntime.hpp"
 #include "core/Concurrency.h"
 #include "core/TensorUtils.hpp"
-#include "backend/cpu/CPUTensorConvert.hpp"
+#include "KleidiAICommon.hpp"
 
 // KleidiAI micro-kernel headers (fp16 / fp32 SME2 matmul + packing).
 #include "kai_common.h"
@@ -284,7 +284,7 @@ ErrorCode KleidiAIConvolution::onExecute(const std::vector<Tensor*>& inputs, con
     auto inputDes = TensorUtils::getDescribe(inputs[0]);
     if (inputDes->dimensionFormat != MNN_DATA_FORMAT_NHWC) {
         MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-            CPUTensorConverter::convert(input, mInputConvertBuffer.get(), core, tId, threadNum);
+            KleidiAICommon::convertLayout(input, mInputConvertBuffer.get(), core, tId, threadNum);
         };
         MNN_CONCURRENCY_END();
         inputPtr = mInputConvertBuffer->host<uint8_t>();
@@ -306,7 +306,7 @@ ErrorCode KleidiAIConvolution::onExecute(const std::vector<Tensor*>& inputs, con
 
     if (outputDes->dimensionFormat != MNN_DATA_FORMAT_NHWC) {
         MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-            CPUTensorConverter::convert(mOutputConvertBuffer.get(), output, core, tId, threadNum);
+            KleidiAICommon::convertLayout(mOutputConvertBuffer.get(), output, core, tId, threadNum);
         };
         MNN_CONCURRENCY_END();
     }
